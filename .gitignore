@@ -12,3 +12,9 @@ __pycache__/
 
 # features
 raw_dataset/
+
+# Python virtual environments
+.venv/
+.venv*/
+venv/
+venv*/

@@ -1,0 +1,94 @@
+/* src/App.css */
+
+/* --- Main Layout --- */
+.app-container {
+  display: flex;
+  height: 100vh; /* Full screen height */
+  width: 100vw;  /* Full screen width */
+  overflow: hidden; /* No scrolling */
+}
+
+.control-panel {
+  width: 340px;
+  padding: 20px;
+  background-color: #f8f9fa;
+  overflow-y: auto; /* Allow scrolling if controls get too long */
+  border-right: 1px solid #ddd;
+  font-family: Arial, sans-serif;
+  font-size: 14px;
+}
+
+.map-container {
+  flex-grow: 1; /* Take up all remaining space */
+  position: relative; /* For positioning the search bar */
+}
+
+/* --- Controls Styling --- */
+.control-panel h2 {
+  font-size: 20px;
+  margin-top: 0;
+  color: #007bff; /* Blue from Bootstrap */
+}
+
+.control-group {
+  margin-bottom: 20px;
+}
+
+.control-group strong {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.control-group select,
+.control-group input[type="text"] {
+  width: 100%;
+  padding: 5px;
+  box-sizing: border-box; /* Makes padding work nicely */
+}
+
+.area-select {
+  height: 150px; /* Make the multi-select box taller */
+}
+
+.checkbox-group {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.checkbox-group input {
+  margin-right: 8px;
+}
+
+/* --- Search Bar --- */
+.search-bar {
+  position: absolute;
+  top: 15px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  background: white;
+  padding: 5px;
+  border-radius: 5px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+
+.search-bar input {
+  border: none;
+  padding: 5px 10px;
+  width: 300px;
+  outline: none;
+}
+
+.search-bar button {
+  border: none;
+  background-color: #007bff;
+  color: white;
+  padding: 5px 15px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.search-bar button:hover {
+  background-color: #0056b3;
+}
