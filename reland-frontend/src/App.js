@@ -1,5 +1,5 @@
 // src/App.js
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Map, { Source, Layer, NavigationControl } from 'react-map-gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import './App.css'; // We will create this file for styling
@@ -98,6 +98,11 @@ function App() {
 
   // Search state
   const [searchText, setSearchText] = useState('');
+  
+  // Hover state for tooltips
+  const [hoveredPoint, setHoveredPoint] = useState(null);
+  const [hoverPosition, setHoverPosition] = useState({ x: 0, y: 0 });
+  const mapRef = useRef(null);
 
   
   // --- Data Fetching (Side Effects) ---
@@ -336,8 +341,29 @@ function App() {
         </div>
         
         <Map
+          ref={mapRef}
           {...viewport} // Spread the viewport state
           onMove={evt => setViewport(evt.viewState)} // Update state on move
+          onMouseMove={(evt) => {
+            // Query features at mouse position using the map instance
+            if (mapRef.current) {
+              const map = mapRef.current.getMap();
+              const features = map.queryRenderedFeatures(evt.point, {
+                layers: ['prediction-points']
+              });
+              
+              if (features.length > 0) {
+                const feature = features[0];
+                setHoveredPoint(feature.properties);
+                setHoverPosition({ x: evt.point.x, y: evt.point.y });
+              } else {
+                setHoveredPoint(null);
+              }
+            }
+          }}
+          onMouseLeave={() => {
+            setHoveredPoint(null);
+          }}
           style={{ width: '100%', height: '100%' }}
           mapStyle={`mapbox://styles/mapbox/${mapStyle}`}
           mapboxAccessToken={MAPBOX_TOKEN}
@@ -351,6 +377,36 @@ function App() {
           {showPrediction && predictionData && (
             <Source type="geojson" data={predictionData}>
               <Layer {...predictionLayerStyle} />
+            </Source>
+          )}
+          
+          {/* 1b. Prediction Layer - Circle Points (for hover interaction) */}
+          {showPrediction && predictionData && (
+            <Source type="geojson" data={predictionData}>
+              <Layer
+                id="prediction-points"
+                type="circle"
+                paint={{
+                  'circle-radius': [
+                    'interpolate',
+                    ['linear'],
+                    ['get', 'sonson_avg'],
+                    0, 3,
+                    1, 8
+                  ],
+                  'circle-color': [
+                    'interpolate',
+                    ['linear'],
+                    ['get', 'sonson_avg'],
+                    0, 'rgb(28,238,238)', // Cyan (low risk)
+                    0.5, 'yellow',        // Yellow (mid risk)
+                    1, 'red'               // Red (high risk)
+                  ],
+                  'circle-opacity': 0.6,
+                  'circle-stroke-width': 1,
+                  'circle-stroke-color': '#fff'
+                }}
+              />
             </Source>
           )}
           
@@ -385,6 +441,41 @@ function App() {
           {/* Add this layer similar to the historical one... */}
           
         </Map>
+        
+        {/* Hover Tooltip - positioned relative to map container */}
+        {hoveredPoint && (
+          <div style={{
+            position: 'absolute',
+            left: hoverPosition.x,
+            top: hoverPosition.y,
+            background: 'rgba(255, 255, 255, 0.95)',
+            padding: '10px',
+            borderRadius: '5px',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+            pointerEvents: 'none',
+            zIndex: 1000,
+            transform: 'translate(-50%, -100%)',
+            marginTop: '-10px',
+            fontSize: '13px',
+            lineHeight: '1.5',
+            minWidth: '200px'
+          }}>
+            <div style={{ fontWeight: 'bold', marginBottom: '5px', color: '#007bff' }}>
+              Location Details
+            </div>
+            <div>
+              <strong>Location:</strong> ({hoveredPoint.LATITUD_Y?.toFixed(6)}, {hoveredPoint.LONGITUD_X?.toFixed(6)})
+            </div>
+            <div>
+              <strong>Prediction Risk:</strong> {hoveredPoint.sonson_avg?.toFixed(6) || 'N/A'}
+            </div>
+            {hoveredPoint.Municipio && (
+              <div>
+                <strong>Municipio:</strong> {hoveredPoint.Municipio}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
