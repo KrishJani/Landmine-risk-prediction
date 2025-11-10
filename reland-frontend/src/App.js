@@ -38,7 +38,7 @@ const predictionLayerStyle = {
     'heatmap-radius': [
       'interpolate',
       ['linear'],
-      ['get', 'sonson_avg'],
+      ['get', 'sonson_avg_normalized'],
       0, 5,
       1, 20
     ],
@@ -46,7 +46,7 @@ const predictionLayerStyle = {
     'heatmap-weight': [
       'interpolate',
       ['linear'],
-      ['get', 'sonson_avg'],
+      ['get', 'sonson_avg_normalized'],
       0, 0,
       0.1, 1,
       1, 5
@@ -154,8 +154,35 @@ function App() {
       })
       .then(data => {
         console.log("Map data received:", data);
-        console.log(`Prediction points: ${data.prediction_points?.length || 0}`);
+        console.log(`Risk heatmap points: ${data.risk_heatmap_points?.length || 0}`);
         console.log(`Historical points: ${data.historical_points?.length || 0}`);
+        
+        // Normalize risk scores to 0-1 range for better visualization
+        const normalizeRiskScores = (points) => {
+          if (!points || points.length === 0) return points;
+          
+          // Find min and max risk scores (use risk_score field from new backend)
+          const scores = points.map(p => p.risk_score || p.sonson_avg || 0).filter(s => !isNaN(s) && isFinite(s));
+          if (scores.length === 0) return points;
+          
+          const minScore = Math.min(...scores);
+          const maxScore = Math.max(...scores);
+          const range = maxScore - minScore;
+          
+          console.log(`Risk score range: ${minScore} to ${maxScore}`);
+          
+          // Normalize to 0-1 range
+          return points.map(p => ({
+            ...p,
+            risk_score_normalized: range > 0 
+              ? ((p.risk_score || p.sonson_avg || 0) - minScore) / range 
+              : (p.risk_score || p.sonson_avg || 0),
+            // Keep sonson_avg_normalized for backward compatibility with layer styles
+            sonson_avg_normalized: range > 0 
+              ? ((p.risk_score || p.sonson_avg || 0) - minScore) / range 
+              : (p.risk_score || p.sonson_avg || 0)
+          }));
+        };
         
         // We need to format this data into GeoJSON, the standard for maps
         const toGeoJSON = (points) => {
@@ -170,10 +197,13 @@ function App() {
           };
         };
         
-        const predGeoJSON = toGeoJSON(data.prediction_points || []);
-        console.log("Prediction GeoJSON created:", predGeoJSON ? `${predGeoJSON.features.length} features` : "null");
+        // Use risk_heatmap_points from new backend structure
+        const heatmapPoints = data.risk_heatmap_points || data.prediction_points || [];
+        const normalizedHeatmapPoints = normalizeRiskScores(heatmapPoints);
+        const heatmapGeoJSON = toGeoJSON(normalizedHeatmapPoints);
+        console.log("Heatmap GeoJSON created:", heatmapGeoJSON ? `${heatmapGeoJSON.features.length} features` : "null");
         
-        setPredictionData(predGeoJSON);
+        setPredictionData(heatmapGeoJSON);
         setHistoricalData(toGeoJSON(data.historical_points || []));
         setClusterData(toGeoJSON(data.cluster_points || []));
       })
@@ -306,9 +336,10 @@ function App() {
           <label htmlFor="show-prediction">Show RELand Risk Prediction</label>
         </div>
 
+        {/* Historical Events section - commented out for now */}
+        {/* 
         <div className="control-group">
           <strong>Historical Events</strong>
-          {/* Add "Select All" here later */}
           <div className="checkbox-group">
             <input type="checkbox" id="hist-neg" value={0} onChange={handleHistoricalChange} />
             <label htmlFor="hist-neg">Areas declared mine-free</label>
@@ -322,6 +353,7 @@ function App() {
             <label htmlFor="hist-unk">Areas with no historical data</label>
           </div>
         </div>
+        */}
         
         {/* Add "Danger Zones" (Clusters) controls here... */}
         
@@ -390,14 +422,14 @@ function App() {
                   'circle-radius': [
                     'interpolate',
                     ['linear'],
-                    ['get', 'sonson_avg'],
+                    ['get', 'sonson_avg_normalized'],
                     0, 3,
                     1, 8
                   ],
                   'circle-color': [
                     'interpolate',
                     ['linear'],
-                    ['get', 'sonson_avg'],
+                    ['get', 'sonson_avg_normalized'],
                     0, 'rgb(28,238,238)', // Cyan (low risk)
                     0.5, 'yellow',        // Yellow (mid risk)
                     1, 'red'               // Red (high risk)
@@ -426,8 +458,8 @@ function App() {
             </div>
           )}
 
-          {/* 2. Historical Layer */}
-          {historicalData && (
+          {/* 2. Historical Layer - commented out for now */}
+          {/* {historicalData && (
             <Source type="geojson" data={historicalData}>
               <Layer 
                 {...historicalLayerStyle} 
@@ -435,7 +467,7 @@ function App() {
                 filter={['in', 'mines_outcome', ...showHistorical]}
               />
             </Source>
-          )}
+          )} */}
 
           {/* 3. Cluster Layer */}
           {/* Add this layer similar to the historical one... */}
@@ -467,8 +499,13 @@ function App() {
               <strong>Location:</strong> ({hoveredPoint.LATITUD_Y?.toFixed(6)}, {hoveredPoint.LONGITUD_X?.toFixed(6)})
             </div>
             <div>
-              <strong>Prediction Risk:</strong> {hoveredPoint.sonson_avg?.toFixed(6) || 'N/A'}
+              <strong>Prediction Risk:</strong> {(hoveredPoint.risk_score || hoveredPoint.sonson_avg)?.toFixed(6) || 'N/A'}
             </div>
+            {hoveredPoint.risk_level && (
+              <div>
+                <strong>Risk Level:</strong> {hoveredPoint.risk_level}
+              </div>
+            )}
             {hoveredPoint.Municipio && (
               <div>
                 <strong>Municipio:</strong> {hoveredPoint.Municipio}

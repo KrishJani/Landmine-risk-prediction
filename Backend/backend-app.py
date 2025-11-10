@@ -16,10 +16,10 @@ CORS(app)
 # This is much more efficient than loading it on every request.
 try:
     # Try to load from local file first, fallback to URL
-    local_file = os.path.join(os.path.dirname(__file__), 'website_table.csv')
-    if os.path.exists(local_file):
-        print(f"Loading data from local file: {local_file}")
-        df = pd.read_csv(local_file)
+    risk_file = os.path.join(os.path.dirname(__file__), 'risk_map_predictions.csv')
+    if os.path.exists(risk_file):
+        print(f"Loading data from local file: {risk_file}")
+        df = pd.read_csv(risk_file)
     else:
         print("Local file not found, loading from URL...")
         df = pd.read_csv('https://raw.githubusercontent.com/annawangkkk/minesWeb/main/website_table.csv')
@@ -31,23 +31,42 @@ except Exception as e:
     area_list = []
 
 # --- Helper Function ---
-def get_color_list(df_1_unknow):
-    # This logic from your Dash app is moved to the backend
-    colorList_custer = ['cyan', 'rgb(245, 221, 43)', 'orangered']
-    clusterList = [2, 0, 1]
+def get_color_list(df_to_color, score_column='risk_score'):
+    """
+    This new helper creates risk "bins" from a continuous
+    risk score and assigns a color.
+    """
+    df_to_color = df_to_color.copy()
+
+    # Use pd.qcut to automatically create 3 bins (quantiles)
+    # This is robust even if the scores are very small.
+    # It will label points as 'Low', 'Medium', or 'High'
+    try:
+        df_to_color['risk_level'] = pd.qcut(
+            df_to_color[score_column], 
+            q=3, 
+            labels=['Low', 'Medium', 'High']
+        )
+    except ValueError:
+        # This can happen if there's not enough data to split
+        # Just assign 'Low' to all in that case
+        df_to_color['risk_level'] = 'Low'
+
+    # Map those labels to colors
+    color_map = {
+        'Low': 'rgb(0, 255, 0)',  # Green
+        'Medium': 'rgb(245, 221, 43)', # Yellow
+        'High': 'rgb(255, 0, 0)'    # Red
+    }
     
-    # Use .loc to avoid SettingWithCopyWarning
-    df_1_unknow = df_1_unknow.copy()
-    for item in zip(clusterList, colorList_custer):
-        df_1_unknow.loc[df_1_unknow['cluster'] == item[0], 'colorBasedCluster'] = item[1]
-        
-    colorList = ['lightgrey', 'lime', 'red']
-    labelList = [-1, 0, 1]
+    df_to_color['color'] = df_to_color['risk_level'].map(color_map)
     
-    for item in zip(labelList, colorList):
-        df_1_unknow.loc[df_1_unknow['mines_outcome'] == item[0], 'colorBasedLabel'] = item[1]
+    # Handle historical data
+    # Let's assign a color for historical mines (e.g., 'hist_mines' > 0)
+    # We'll make them purple to stand out
+    df_to_color.loc[df_to_color['hist_mines'] > 0, 'hist_color'] = 'purple'
     
-    return df_1_unknow
+    return df_to_color
 
 # --- API Endpoints ---
 
@@ -77,50 +96,47 @@ def get_initial_data():
 @app.route('/api/map_data')
 def get_map_data():
     """
-    This is the main endpoint that replaces your `update_graph` logic.
-    It accepts "query parameters" from the URL.
-    e.g., /api/map_data?areas=Sonsón,Argelia
+    This is the main endpoint, updated for the new dataset.
+    It returns a risk heatmap and a set of historical mine points.
     """
     
     # 1. Get filter values from the request
-    # .getlist() is used to get all values from a multi-select
     selected_areas = request.args.getlist('areas[]')
+    
+    # You might want to let the user choose which risk score to use
+    # For now, we'll hardcode 'risk_score'
+    score_to_use = 'risk_score' # or 'risk_score_lr'
     
     # 2. Filter the DataFrame (the core pandas logic)
     if not selected_areas:
         # If no areas are selected, return empty data
         return jsonify({
-            "prediction_points": [],
-            "historical_points": [],
-            "cluster_points": []
+            "risk_heatmap_points": [],
+            "historical_points": []
         })
 
     df_1 = df[df['Municipio'].isin(selected_areas)]
-    df_1_with_colors = get_color_list(df_1) # Add color data
     
-    # 3. Separate the data for each layer
-    # This makes it *much* easier for React to handle
+    # 3. Add color data using our NEW helper function
+    df_1_with_colors = get_color_list(df_1, score_to_use)
     
-    # Prediction Layer
-    df_prediction = df_1_with_colors[['LATITUD_Y', 'LONGITUD_X', 'sonson_avg']]
+    # 4. Separate the data for each layer
     
-    # Historical Layer
-    df_historical = df_1_with_colors[
-        ['LATITUD_Y', 'LONGITUD_X', 'mines_outcome', 'colorBasedLabel']
+    # Layer 1: Risk Heatmap (All points)
+    # We select the columns React will need
+    df_heatmap = df_1_with_colors[
+        ['LATITUD_Y', 'LONGITUD_X', score_to_use, 'risk_level', 'color']
     ]
     
-    # Cluster Layer (for unknown outcomes)
-    df_clusters = df_1_with_colors[
-        df_1_with_colors['mines_outcome'] == -1
-    ][['LATITUD_Y', 'LONGITUD_X', 'cluster', 'colorBasedCluster']]
+    # Layer 2: Historical Mines (Only where hist_mines > 0)
+    df_historical = df_1_with_colors[
+        df_1_with_colors['hist_mines'] > 0
+    ][['LATITUD_Y', 'LONGITUD_X', 'hist_mines', 'hist_color']]
     
-    # 4. Convert data to JSON and return it
-    # 'orient='records'' formats the JSON into a list of objects,
-    # which is perfect for React.
+    # 5. Convert data to JSON and return it
     return jsonify({
-        "prediction_points": df_prediction.to_dict(orient='records'),
-        "historical_points": df_historical.to_dict(orient='records'),
-        "cluster_points": df_clusters.to_dict(orient='records')
+        "risk_heatmap_points": df_heatmap.to_dict(orient='records'),
+        "historical_points": df_historical.to_dict(orient='records')
     })
     
 @app.route('/api/geocode')
