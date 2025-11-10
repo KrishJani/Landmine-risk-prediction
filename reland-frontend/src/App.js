@@ -16,8 +16,8 @@ const initialViewport = {
   latitude: 5.920689177,
   longitude: -75.10525796,
   zoom: 9,
-  bearing: 25,
-  pitch: 40
+  bearing: 0,  // No rotation - north up
+  pitch: 0     // Perfect top-down view - no tilt
 };
 
 // --- Layer Styles (from your Dash app) ---
