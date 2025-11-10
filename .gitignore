@@ -18,3 +18,16 @@ raw_dataset/
 .venv*/
 venv/
 venv*/
+
+# Database files (contain sensitive data)
+*.db
+reland.db
+reland-backend/*.db
+reland-backend/reland.db
+
+# CSV files (contain confidential data)
+*.csv
+reland-backend/*.csv
+reland-backend/risk_map_predictions.csv
+reland-backend/EO_events_2510.csv
+processed_dataset/*.csv

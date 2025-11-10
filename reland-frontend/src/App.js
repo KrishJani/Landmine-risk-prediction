@@ -90,6 +90,7 @@ function App() {
   const [showPrediction, setShowPrediction] = useState(true);
   const [showHistorical, setShowHistorical] = useState([]); // Stores [-1, 0, 1]
   const [showClusters, setShowClusters] = useState([]); // Stores [0, 1, 2]
+  const [showConfirmedEvents, setShowConfirmedEvents] = useState(false); // Toggle for confirmed events visibility
   
   // Data state
   const [predictionData, setPredictionData] = useState(null);
@@ -103,6 +104,20 @@ function App() {
   const [hoveredPoint, setHoveredPoint] = useState(null);
   const [hoverPosition, setHoverPosition] = useState({ x: 0, y: 0 });
   const mapRef = useRef(null);
+  
+  // Label and event management state
+  const [userLabels, setUserLabels] = useState([]);
+  const [confirmedEvents, setConfirmedEvents] = useState([]);
+  const [selectedPoint, setSelectedPoint] = useState(null); // Point clicked for labeling
+  const [showLabelDialog, setShowLabelDialog] = useState(false);
+  const [showEventsPanel, setShowEventsPanel] = useState(false);
+  const [labelForm, setLabelForm] = useState({ 
+    label: null, 
+    notes: '', 
+    manualLat: '', 
+    manualLon: '',
+    useManualCoords: false 
+  });
 
   
   // --- Data Fetching (Side Effects) ---
@@ -156,6 +171,7 @@ function App() {
         console.log("Map data received:", data);
         console.log(`Risk heatmap points: ${data.risk_heatmap_points?.length || 0}`);
         console.log(`Historical points: ${data.historical_points?.length || 0}`);
+        console.log(`Confirmed events from map_data: ${data.confirmed_events?.length || 0}`);
         
         // Normalize risk scores to 0-1 range for better visualization
         const normalizeRiskScores = (points) => {
@@ -206,6 +222,21 @@ function App() {
         setPredictionData(heatmapGeoJSON);
         setHistoricalData(toGeoJSON(data.historical_points || []));
         setClusterData(toGeoJSON(data.cluster_points || []));
+        
+        // Store confirmed events from map_data (only update if we don't have them yet)
+        // This prevents overwriting the full list when areas change
+        // We use a functional update to avoid dependency issues
+        setConfirmedEvents(prevEvents => {
+          if (data.confirmed_events) {
+            // Only update if we don't have events yet, or if we get more events
+            if (prevEvents.length === 0) {
+              return data.confirmed_events;
+            } else if (data.confirmed_events.length > prevEvents.length) {
+              return data.confirmed_events;
+            }
+          }
+          return prevEvents; // Keep existing events
+        });
       })
       .catch(err => {
         console.error("Error fetching map data:", err);
@@ -281,6 +312,208 @@ function App() {
         alert(`Geocoding error: ${err.message || 'Could not connect to geocoding service. Make sure the backend is running.'}`);
       });
   };
+
+  // Label management handlers
+  const handlePointClick = (evt) => {
+    if (mapRef.current) {
+      const map = mapRef.current.getMap();
+      const features = map.queryRenderedFeatures(evt.point, {
+        layers: ['prediction-points']
+      });
+      
+      if (features.length > 0) {
+        const feature = features[0];
+        const point = feature.properties;
+        setSelectedPoint(point);
+        // Check if label already exists
+        const existingLabel = point.location_id ? userLabels.find(l => l.location_id === point.location_id) : null;
+        if (existingLabel) {
+          setLabelForm({ 
+            label: existingLabel.label, 
+            notes: existingLabel.notes || '',
+            manualLat: '',
+            manualLon: '',
+            useManualCoords: false
+          });
+        } else {
+          setLabelForm({ 
+            label: null, 
+            notes: '',
+            manualLat: point.LATITUD_Y?.toFixed(6) || '',
+            manualLon: point.LONGITUD_X?.toFixed(6) || '',
+            useManualCoords: false
+          });
+        }
+        setShowLabelDialog(true);
+      } else {
+        // Clicked on empty space - allow manual entry
+        const lngLat = evt.lngLat;
+        setSelectedPoint(null);
+        setLabelForm({ 
+          label: null, 
+          notes: '',
+          manualLat: lngLat.lat.toFixed(6),
+          manualLon: lngLat.lng.toFixed(6),
+          useManualCoords: true
+        });
+        setShowLabelDialog(true);
+      }
+    }
+  };
+
+  const handleSaveLabel = () => {
+    if (labelForm.label === null) {
+      alert('Please select a label (0 or 1)');
+      return;
+    }
+
+    // Determine location_id or coordinates
+    let location_id = null;
+    let lat = null;
+    let lon = null;
+
+    if (labelForm.useManualCoords) {
+      // Manual coordinate entry
+      lat = parseFloat(labelForm.manualLat);
+      lon = parseFloat(labelForm.manualLon);
+      
+      if (isNaN(lat) || isNaN(lon)) {
+        alert('Please enter valid coordinates');
+        return;
+      }
+    } else {
+      // Clicked on map
+      if (!selectedPoint || !selectedPoint.location_id) {
+        alert('Please click on a point on the map or enter coordinates manually');
+        return;
+      }
+      location_id = selectedPoint.location_id;
+    }
+
+    fetch('http://localhost:5001/api/labels', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        location_id: location_id,
+        lat: lat,
+        lon: lon,
+        label: parseInt(labelForm.label),
+        notes: labelForm.notes
+      })
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          // Update local state
+          const existingIndex = userLabels.findIndex(l => l.location_id === data.location_id);
+          if (existingIndex >= 0) {
+            const updated = [...userLabels];
+            updated[existingIndex] = data;
+            setUserLabels(updated);
+          } else {
+            setUserLabels([...userLabels, data]);
+          }
+          
+          // If label is 1, refresh confirmed events
+          if (data.label === 1) {
+            fetchConfirmedEvents();
+          }
+          
+          setShowLabelDialog(false);
+          setSelectedPoint(null);
+          setLabelForm({ label: null, notes: '', manualLat: '', manualLon: '', useManualCoords: false });
+          alert('Label saved successfully!');
+        }
+      })
+      .catch(err => {
+        console.error('Error saving label:', err);
+        alert('Error saving label. Please try again.');
+      });
+  };
+
+  const handleDeleteLabel = () => {
+    if (!selectedPoint) return;
+    
+    if (!window.confirm('Are you sure you want to delete this label?')) {
+      return;
+    }
+
+    fetch(`http://localhost:5001/api/labels/${selectedPoint.location_id}`, {
+      method: 'DELETE'
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          setUserLabels(userLabels.filter(l => l.location_id !== selectedPoint.location_id));
+          fetchConfirmedEvents(); // Refresh confirmed events
+          setShowLabelDialog(false);
+          setSelectedPoint(null);
+          alert('Label deleted successfully!');
+        }
+      })
+      .catch(err => {
+        console.error('Error deleting label:', err);
+        alert('Error deleting label. Please try again.');
+      });
+  };
+
+  // Confirmed events handlers
+  const fetchConfirmedEvents = () => {
+    fetch('http://localhost:5001/api/confirmed_events')
+      .then(res => res.json())
+      .then(data => {
+        if (data.confirmed_events) {
+          console.log(`Fetched ${data.confirmed_events.length} confirmed events from /api/confirmed_events`);
+          setConfirmedEvents(data.confirmed_events);
+        }
+      })
+      .catch(err => {
+        console.error('Error fetching confirmed events:', err);
+      });
+  };
+
+  const handleDeleteEvent = (eventId) => {
+    if (!window.confirm('Are you sure you want to delete this confirmed event?')) {
+      return;
+    }
+
+    fetch(`http://localhost:5001/api/confirmed_events/${eventId}`, {
+      method: 'DELETE'
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          setConfirmedEvents(confirmedEvents.filter(e => e.id !== eventId));
+          alert('Event deleted successfully!');
+        }
+      })
+      .catch(err => {
+        console.error('Error deleting event:', err);
+        alert('Error deleting event. Please try again.');
+      });
+  };
+
+  // Load labels and events on mount
+  useEffect(() => {
+    fetch('http://localhost:5001/api/labels')
+      .then(res => res.json())
+      .then(data => {
+        if (data.labels) {
+          setUserLabels(data.labels);
+        }
+      })
+      .catch(err => console.error('Error fetching labels:', err));
+    
+    fetchConfirmedEvents();
+  }, []);
   
 
   // --- JSX (The UI Rendering) ---
@@ -334,6 +567,62 @@ function App() {
             onChange={e => setShowPrediction(e.target.checked)}
           />
           <label htmlFor="show-prediction">Show RELand Risk Prediction</label>
+        </div>
+
+        <div className="control-group">
+          <strong>Confirmed Events</strong>
+          <input 
+            type="checkbox" 
+            id="show-confirmed-events" 
+            checked={showConfirmedEvents}
+            onChange={e => setShowConfirmedEvents(e.target.checked)}
+          />
+          <label htmlFor="show-confirmed-events">Show Confirmed Events on Map</label>
+        </div>
+
+        <div className="control-group">
+          <strong>Data Management</strong>
+          <button 
+            onClick={() => {
+              setSelectedPoint(null);
+              setLabelForm({ 
+                label: null, 
+                notes: '', 
+                manualLat: '', 
+                manualLon: '',
+                useManualCoords: true 
+              });
+              setShowLabelDialog(true);
+            }}
+            style={{
+              width: '100%',
+              padding: '8px',
+              marginTop: '5px',
+              backgroundColor: '#28a745',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              marginBottom: '5px'
+            }}
+          >
+            Add Label Manually
+          </button>
+          <button 
+            onClick={() => setShowEventsPanel(!showEventsPanel)}
+            style={{
+              width: '100%',
+              padding: '8px',
+              marginTop: '5px',
+              backgroundColor: showEventsPanel ? '#007bff' : '#6c757d',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            {showEventsPanel ? 'Hide' : 'Show'} Confirmed Events Panel ({confirmedEvents.length})
+          </button>
         </div>
 
         {/* Historical Events section - commented out for now */}
@@ -396,6 +685,7 @@ function App() {
           onMouseLeave={() => {
             setHoveredPoint(null);
           }}
+          onClick={handlePointClick}
           style={{ width: '100%', height: '100%' }}
           mapStyle={`mapbox://styles/mapbox/${mapStyle}`}
           mapboxAccessToken={MAPBOX_TOKEN}
@@ -469,7 +759,31 @@ function App() {
             </Source>
           )} */}
 
-          {/* 3. Cluster Layer */}
+          {/* 3. Confirmed Events Layer - Only show if checkbox is checked */}
+          {showConfirmedEvents && confirmedEvents.length > 0 && (
+            <Source type="geojson" data={{
+              type: 'FeatureCollection',
+              features: confirmedEvents.map(event => ({
+                type: 'Feature',
+                geometry: { type: 'Point', coordinates: [event.lon, event.lat] },
+                properties: event
+              }))
+            }}>
+              <Layer
+                id="confirmed-events"
+                type="circle"
+                paint={{
+                  'circle-radius': 8,
+                  'circle-color': '#ff0000',
+                  'circle-opacity': 0.8,
+                  'circle-stroke-width': 2,
+                  'circle-stroke-color': '#ffffff'
+                }}
+              />
+            </Source>
+          )}
+
+          {/* 4. Cluster Layer */}
           {/* Add this layer similar to the historical one... */}
           
         </Map>
@@ -509,6 +823,298 @@ function App() {
             {hoveredPoint.Municipio && (
               <div>
                 <strong>Municipio:</strong> {hoveredPoint.Municipio}
+              </div>
+            )}
+            {hoveredPoint.location_id && (
+              <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #ddd' }}>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const point = hoveredPoint;
+                    setSelectedPoint(point);
+                    const existingLabel = point.location_id ? userLabels.find(l => l.location_id === point.location_id) : null;
+                    setLabelForm({ 
+                      label: existingLabel ? existingLabel.label : null, 
+                      notes: existingLabel ? (existingLabel.notes || '') : '',
+                      manualLat: '',
+                      manualLon: '',
+                      useManualCoords: false
+                    });
+                    setShowLabelDialog(true);
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '5px',
+                    backgroundColor: '#007bff',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '3px',
+                    cursor: 'pointer',
+                    fontSize: '12px'
+                  }}
+                >
+                  {userLabels.find(l => l.location_id === hoveredPoint.location_id) 
+                    ? 'Edit Label' 
+                    : 'Add Label'}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Label Dialog */}
+        {showLabelDialog && (
+          <div style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            background: 'white',
+            padding: '20px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: 2000,
+            minWidth: '350px',
+            maxWidth: '550px'
+          }}>
+            <h3 style={{ marginTop: 0 }}>Add/Edit Label</h3>
+            
+            {/* Location Source Toggle */}
+            <div style={{ marginBottom: '15px', padding: '10px', backgroundColor: '#f8f9fa', borderRadius: '4px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={labelForm.useManualCoords}
+                  onChange={(e) => setLabelForm({ 
+                    ...labelForm, 
+                    useManualCoords: e.target.checked,
+                    manualLat: e.target.checked ? (selectedPoint?.LATITUD_Y?.toFixed(6) || '') : '',
+                    manualLon: e.target.checked ? (selectedPoint?.LONGITUD_X?.toFixed(6) || '') : ''
+                  })}
+                  style={{ marginRight: '8px' }}
+                />
+                <span>Enter coordinates manually</span>
+              </label>
+            </div>
+
+            {/* Location Display/Input */}
+            {labelForm.useManualCoords ? (
+              <div style={{ marginBottom: '15px' }}>
+                <label style={{ display: 'block', marginBottom: '5px' }}>
+                  <strong>Location (Latitude, Longitude):</strong>
+                </label>
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                  <input
+                    type="number"
+                    step="any"
+                    placeholder="Latitude"
+                    value={labelForm.manualLat}
+                    onChange={(e) => setLabelForm({ ...labelForm, manualLat: e.target.value })}
+                    style={{
+                      flex: 1,
+                      padding: '5px',
+                      border: '1px solid #ddd',
+                      borderRadius: '4px'
+                    }}
+                  />
+                  <span>,</span>
+                  <input
+                    type="number"
+                    step="any"
+                    placeholder="Longitude"
+                    value={labelForm.manualLon}
+                    onChange={(e) => setLabelForm({ ...labelForm, manualLon: e.target.value })}
+                    style={{
+                      flex: 1,
+                      padding: '5px',
+                      border: '1px solid #ddd',
+                      borderRadius: '4px'
+                    }}
+                  />
+                </div>
+                <div style={{ fontSize: '12px', color: '#666', marginTop: '5px' }}>
+                  Format: (10.576107, -75.427811)
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginBottom: '15px' }}>
+                <strong>Location:</strong> {selectedPoint ? 
+                  `(${selectedPoint.LATITUD_Y?.toFixed(6)}, ${selectedPoint.LONGITUD_X?.toFixed(6)})` : 
+                  'Click on map to select location'}
+              </div>
+            )}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', marginBottom: '5px' }}>
+                <strong>Label:</strong>
+              </label>
+              <div>
+                <label style={{ marginRight: '15px' }}>
+                  <input
+                    type="radio"
+                    name="label"
+                    value="0"
+                    checked={labelForm.label === 0}
+                    onChange={(e) => setLabelForm({ ...labelForm, label: parseInt(e.target.value) })}
+                  />
+                  {' '}0 (Mine-free)
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="label"
+                    value="1"
+                    checked={labelForm.label === 1}
+                    onChange={(e) => setLabelForm({ ...labelForm, label: parseInt(e.target.value) })}
+                  />
+                  {' '}1 (Confirmed Mine)
+                </label>
+              </div>
+            </div>
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', marginBottom: '5px' }}>
+                <strong>Notes (optional):</strong>
+              </label>
+              <textarea
+                value={labelForm.notes}
+                onChange={(e) => setLabelForm({ ...labelForm, notes: e.target.value })}
+                style={{
+                  width: '100%',
+                  minHeight: '60px',
+                  padding: '5px',
+                  border: '1px solid #ddd',
+                  borderRadius: '4px'
+                }}
+                placeholder="Add any notes about this location..."
+              />
+            </div>
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => {
+                  setShowLabelDialog(false);
+                  setSelectedPoint(null);
+                  setLabelForm({ label: null, notes: '', manualLat: '', manualLon: '', useManualCoords: false });
+                }}
+                style={{
+                  padding: '8px 16px',
+                  backgroundColor: '#6c757d',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer'
+                }}
+              >
+                Cancel
+              </button>
+              {selectedPoint && userLabels.find(l => l.location_id === selectedPoint.location_id) && (
+                <button
+                  onClick={handleDeleteLabel}
+                  style={{
+                    padding: '8px 16px',
+                    backgroundColor: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Delete
+                </button>
+              )}
+              <button
+                onClick={handleSaveLabel}
+                style={{
+                  padding: '8px 16px',
+                  backgroundColor: '#28a745',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer'
+                }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Confirmed Events Panel */}
+        {showEventsPanel && (
+          <div style={{
+            position: 'absolute',
+            top: '60px',
+            right: '10px',
+            width: '400px',
+            maxHeight: '70vh',
+            background: 'white',
+            padding: '15px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: 1500,
+            overflowY: 'auto'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+              <h3 style={{ margin: 0 }}>Confirmed Events ({confirmedEvents.length})</h3>
+              <button
+                onClick={() => setShowEventsPanel(false)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  fontSize: '20px',
+                  cursor: 'pointer',
+                  color: '#666'
+                }}
+              >
+                ×
+              </button>
+            </div>
+            {confirmedEvents.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#666', padding: '20px' }}>
+                No confirmed events yet. Add labels with value "1" to create events.
+              </div>
+            ) : (
+              <div>
+                {confirmedEvents.map(event => (
+                  <div
+                    key={event.id}
+                    style={{
+                      border: '1px solid #ddd',
+                      borderRadius: '4px',
+                      padding: '10px',
+                      marginBottom: '10px',
+                      backgroundColor: '#f8f9fa'
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '5px' }}>
+                      <strong>{event.municipio}</strong>
+                      <button
+                        onClick={() => handleDeleteEvent(event.id)}
+                        style={{
+                          background: '#dc3545',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '3px',
+                          padding: '3px 8px',
+                          cursor: 'pointer',
+                          fontSize: '11px'
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#666' }}>
+                      <div>Location: ({event.lat?.toFixed(4)}, {event.lon?.toFixed(4)})</div>
+                      {event.event_date && (
+                        <div>Date: {new Date(event.event_date).toLocaleDateString()}</div>
+                      )}
+                      {event.source && (
+                        <div>Source: {event.source}</div>
+                      )}
+                      {event.description && (
+                        <div style={{ marginTop: '5px', fontStyle: 'italic' }}>{event.description}</div>
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
