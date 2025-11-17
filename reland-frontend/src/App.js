@@ -1,5 +1,5 @@
 // src/App.js
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Map, { Source, Layer, NavigationControl } from 'react-map-gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import './App.css'; // We will create this file for styling
@@ -617,11 +617,30 @@ function App() {
     fetchConfirmedEvents();
   }, []);
 
-  // Handler to load custom icons when map loads
-  const handleMapLoad = () => {
+  // Function to load custom icons - reusable for map load and style changes
+  const loadCustomIcons = useCallback(() => {
     if (!mapRef.current) return;
     
     const map = mapRef.current.getMap();
+    
+    // Wait for style to be loaded before adding images
+    if (!map.isStyleLoaded()) {
+      // If style not loaded, wait for it
+      const handleStyleLoad = () => {
+        // Wait a bit more to ensure style is fully ready
+        setTimeout(() => {
+          loadCustomIcons();
+        }, 200);
+      };
+      map.once('style.load', handleStyleLoad);
+      return;
+    }
+    
+    // Ensure we have a valid map instance
+    if (!map || typeof map.addImage !== 'function') {
+      console.warn('Map instance not ready for adding images');
+      return;
+    }
     
     // Create square icon template (SVG)
     const squareSvgTemplate = (color) => `
@@ -678,7 +697,40 @@ function App() {
       map.addImage('square-marker', defaultSquareImg);
     };
     defaultSquareImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(defaultSquareSvg);
-  };
+  }, []);
+
+  // Handler to load custom icons when map loads
+  const handleMapLoad = useCallback(() => {
+    loadCustomIcons();
+  }, [loadCustomIcons]);
+
+  // Re-load icons when map style changes (using useEffect as backup)
+  useEffect(() => {
+    if (!mapRef.current) return;
+    
+    const map = mapRef.current.getMap();
+    
+    // Small delay to ensure map style has changed
+    const timeoutId = setTimeout(() => {
+      if (map.isStyleLoaded()) {
+        loadCustomIcons();
+      } else {
+        // Wait for style to load
+        const waitForStyle = () => {
+          if (map.isStyleLoaded()) {
+            loadCustomIcons();
+          } else {
+            map.once('style.load', waitForStyle);
+          }
+        };
+        waitForStyle();
+      }
+    }, 300);
+    
+    return () => {
+      clearTimeout(timeoutId);
+    };
+  }, [mapStyle, loadCustomIcons]);
 
   // --- JSX (The UI Rendering) ---
   // This is the React equivalent of your 'app.layout'
@@ -840,6 +892,12 @@ function App() {
           ref={mapRef}
           {...viewport} // Spread the viewport state
           onLoad={handleMapLoad}
+          onStyleData={() => {
+            // Delay to ensure style is fully loaded
+            setTimeout(() => {
+              loadCustomIcons();
+            }, 100);
+          }}
           onMove={evt => setViewport(evt.viewState)} // Update state on move
           onMouseMove={(evt) => {
             // Query features at mouse position using the map instance
