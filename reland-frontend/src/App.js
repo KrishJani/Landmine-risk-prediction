@@ -91,11 +91,13 @@ function App() {
   const [showHistorical, setShowHistorical] = useState([]); // Stores [-1, 0, 1]
   const [showClusters, setShowClusters] = useState([]); // Stores [0, 1, 2]
   const [showConfirmedEvents, setShowConfirmedEvents] = useState(false); // Toggle for confirmed events visibility
+  const [showMunicipalityBorders, setShowMunicipalityBorders] = useState(true); // Toggle for municipality borders
   
   // Data state
   const [predictionData, setPredictionData] = useState(null);
   const [historicalData, setHistoricalData] = useState(null);
   const [clusterData, setClusterData] = useState(null);
+  const [municipalityBorders, setMunicipalityBorders] = useState(null);
 
   // Search state
   const [searchText, setSearchText] = useState('');
@@ -152,6 +154,7 @@ function App() {
       setPredictionData(null);
       setHistoricalData(null);
       setClusterData(null);
+      setMunicipalityBorders(null);
       return;
     }
     
@@ -299,6 +302,48 @@ function App() {
         console.error("Error fetching map data:", err);
         alert("Error fetching map data from backend.");
       });
+    
+    // Fetch municipality borders for selected areas
+    // Only fetch if we have selected areas (don't fetch all borders at once)
+    if (selectedAreas.length > 0) {
+      const borderParams = new URLSearchParams();
+      // Send names as-is (backend will handle normalization)
+      selectedAreas.forEach(area => {
+        if (area && area.toLowerCase() !== 'unknown') {
+          borderParams.append('municipalities[]', area);
+        }
+      });
+      
+      // Only fetch if we have valid areas
+      if (borderParams.toString()) {
+        fetch(`http://localhost:5001/api/municipality_borders?${borderParams.toString()}`)
+          .then(res => {
+            if (!res.ok) {
+              throw new Error(`HTTP error! status: ${res.status}`);
+            }
+            return res.json();
+          })
+          .then(data => {
+            console.log("Municipality borders received:", data);
+            if (data.type === 'FeatureCollection' && data.features && data.features.length > 0) {
+              setMunicipalityBorders(data);
+              console.log(`Loaded ${data.features.length} municipality borders`);
+            } else {
+              console.warn("No municipality borders found for selected areas");
+              setMunicipalityBorders(null);
+            }
+          })
+          .catch(err => {
+            console.error("Error fetching municipality borders:", err);
+            // Don't show alert for borders - it's not critical
+            setMunicipalityBorders(null);
+          });
+      } else {
+        setMunicipalityBorders(null);
+      }
+    } else {
+      setMunicipalityBorders(null);
+    }
       
   }, [selectedAreas]); // The "dependency array" - this re-runs the effect
 
@@ -689,6 +734,17 @@ function App() {
         </div>
 
         <div className="control-group">
+          <strong>Municipality Borders</strong>
+          <input 
+            type="checkbox" 
+            id="show-municipality-borders" 
+            checked={showMunicipalityBorders}
+            onChange={e => setShowMunicipalityBorders(e.target.checked)}
+          />
+          <label htmlFor="show-municipality-borders">Show Municipality Borders</label>
+        </div>
+
+        <div className="control-group">
           <strong>Confirmed Events</strong>
           <input 
             type="checkbox" 
@@ -871,6 +927,29 @@ function App() {
               />
             </Source>
           )} */}
+
+          {/* 2.5. Municipality Borders Layer */}
+          {showMunicipalityBorders && municipalityBorders && (
+            <Source type="geojson" data={municipalityBorders}>
+              <Layer
+                id="municipality-borders-fill"
+                type="fill"
+                paint={{
+                  'fill-color': 'rgba(0, 123, 255, 0.1)', // Light blue fill
+                  'fill-opacity': 0.3
+                }}
+              />
+              <Layer
+                id="municipality-borders-outline"
+                type="line"
+                paint={{
+                  'line-color': '#007bff', // Blue outline
+                  'line-width': 2,
+                  'line-opacity': 0.8
+                }}
+              />
+            </Source>
+          )}
 
           {/* 3. Confirmed Events Layer - Only show if checkbox is checked */}
           {showConfirmedEvents && confirmedEvents.length > 0 && (

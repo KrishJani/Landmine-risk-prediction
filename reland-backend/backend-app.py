@@ -6,6 +6,7 @@ from datetime import datetime
 from math import isfinite
 from dotenv import load_dotenv
 from models import db, Location, UserLabel, ConfirmedEvent
+from municipality_borders import get_municipality_borders, get_all_municipality_names
 
 # Load environment variables from .env file
 load_dotenv()
@@ -91,6 +92,7 @@ def index():
         "endpoints": {
             "/api/initial_data": "GET - Get list of available areas",
             "/api/map_data": "GET - Get map data for selected areas",
+            "/api/municipality_borders": "GET - Get municipality borders as GeoJSON",
             "/api/geocode": "GET - Geocode an address",
             "/api/labels": "GET/POST - Manage user labels",
             "/api/confirmed_events": "GET/POST/PUT/DELETE - Manage confirmed events",
@@ -103,7 +105,7 @@ def get_initial_data():
     """Get list of available areas from database"""
     try:
         areas = db.session.query(Location.municipio).distinct().all()
-        area_list = [area[0] for area in areas if area[0]]
+        area_list = [area[0] for area in areas if area[0] and area[0].lower() != 'unknown']
         area_list.sort()
         return jsonify({"areas": area_list})
     except Exception:
@@ -190,6 +192,27 @@ def get_map_data():
         "historical_points": historical_points,
         "confirmed_events": [event.to_dict() for event in confirmed_events]
     })
+
+@app.route('/api/municipality_borders')
+def get_municipality_borders_endpoint():
+    """Get municipality borders as GeoJSON"""
+    try:
+        # Get municipality names from query parameters
+        municipality_names = request.args.getlist('municipalities[]')
+        
+        if not municipality_names:
+            # If no municipalities specified, return all borders
+            borders = get_municipality_borders()
+        else:
+            # Filter by specified municipalities
+            borders = get_municipality_borders(municipality_names)
+        
+        return jsonify(borders)
+        
+    except FileNotFoundError as e:
+        return jsonify({"error": f"Shapefile not found: {str(e)}"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     
 @app.route('/api/geocode')
 def geocode_address():
@@ -266,10 +289,29 @@ def add_label():
                     func.abs(Location.lon - float(lon)) < 0.01
                 ).first()
                 
+                # Try to find the closest municipality from shapefile if available
+                municipio_name = None
+                if nearby:
+                    municipio_name = nearby.municipio
+                else:
+                    # Try to find municipality from shapefile based on coordinates
+                    try:
+                        from municipality_borders import load_municipality_borders
+                        import geopandas as gpd
+                        from shapely.geometry import Point
+                        gdf = load_municipality_borders()
+                        point = Point(float(lon), float(lat))
+                        # Find which municipality contains this point
+                        containing = gdf[gdf.geometry.contains(point)]
+                        if len(containing) > 0:
+                            municipio_name = containing.iloc[0]['MPIO_CNMBR']
+                    except Exception:
+                        pass
+                
                 location = Location(
                     lat=float(lat),
                     lon=float(lon),
-                    municipio=nearby.municipio if nearby else 'Unknown',
+                    municipio=municipio_name if municipio_name else 'Unknown',
                     risk_score=None,
                     risk_level='Unknown'
                 )
