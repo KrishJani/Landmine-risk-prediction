@@ -1,6 +1,6 @@
 # Database Setup Guide
 
-This application uses SQLite for storing user labels and confirmed events.
+This application uses PostgreSQL for storing user labels and confirmed events.
 
 ## Database Schema
 
@@ -36,7 +36,7 @@ This application uses SQLite for storing user labels and confirmed events.
    ```
    
    This will:
-   - Create the database file (`reland.db`)
+   - Create all database tables in PostgreSQL
    - Load locations from `risk_map_predictions.csv`
    - Load confirmed events from `EO_events_2510.csv` (if available)
 
@@ -45,7 +45,7 @@ This application uses SQLite for storing user labels and confirmed events.
    python backend-app.py
    ```
    
-   The database will be automatically created if it doesn't exist.
+   Make sure PostgreSQL is running and your `.env` file is configured with the correct `DATABASE_URL`.
 
 ## API Endpoints
 
@@ -84,14 +84,14 @@ This application uses SQLite for storing user labels and confirmed events.
 2. View all confirmed events in the side panel
 3. Delete events using the "Delete" button
 
-## Database File Location
+## Database Configuration
 
-The database file (`reland.db`) is stored in the `Backend/` directory.
+The database connection is configured via the `DATABASE_URL` environment variable in the `.env` file.
 
 **Important:** 
-- The database file should be backed up regularly
-- To reset the database, delete `reland.db` and run `init_database.py` again
-- The database is automatically created when the backend starts if it doesn't exist
+- The database should be backed up regularly using PostgreSQL backup tools
+- To reset the database, drop and recreate it, then run `init_database.py` again
+- See `README_POSTGRES.md` for detailed PostgreSQL setup instructions
 
 ## Data Flow
 

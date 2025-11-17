@@ -4,22 +4,37 @@ Flask REST API backend for the RELand landmine risk prediction system.
 
 ## Setup
 
-1. **Create and activate virtual environment:**
+1. **Set up PostgreSQL database:**
+   - Install PostgreSQL (see `README_POSTGRES.md` for detailed instructions)
+   - Create database and user:
+     ```sql
+     CREATE DATABASE reland_db;
+     CREATE USER reland_user WITH PASSWORD 'your_password';
+     GRANT ALL PRIVILEGES ON DATABASE reland_db TO reland_user;
+     ```
+
+2. **Configure environment variables:**
+   ```bash
+   cp .env.example .env
+   # Edit .env and set your DATABASE_URL
+   ```
+
+3. **Create and activate virtual environment:**
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    ```
 
-2. **Install dependencies:**
+4. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Initialize database:**
+5. **Initialize database:**
    ```bash
    python init_database.py
    ```
-   This loads data from CSV files into the database (one-time setup).
+   This creates tables and loads data from CSV files into PostgreSQL (one-time setup).
 
 ## Running the Server
 
@@ -62,7 +77,7 @@ The server will start on `http://127.0.0.1:5001`
 
 ## Data Storage
 
-All data is stored in SQLite database (`reland.db`). CSV files are only used during initial database setup via `init_database.py`. After setup, the backend operates completely database-driven.
+All data is stored in PostgreSQL database. CSV files are only used during initial database setup via `init_database.py`. After setup, the backend operates completely database-driven.
 
-See `README_DATABASE.md` for database schema and usage details.
+See `README_POSTGRES.md` for PostgreSQL setup instructions and `README_DATABASE.md` for database schema and usage details.
 

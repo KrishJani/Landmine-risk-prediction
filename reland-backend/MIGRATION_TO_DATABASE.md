@@ -1,7 +1,7 @@
 # Database-Only Migration Complete
 
 ## Overview
-The backend has been completely migrated from CSV files to database-only operation. All data is now stored in and retrieved from SQLite database (`reland.db`).
+The backend has been completely migrated from CSV files to database-only operation. All data is now stored in and retrieved from PostgreSQL database.
 
 ## What Changed
 
@@ -75,7 +75,7 @@ Content-Type: application/json
 - CSV files are **only** used during initial database setup via `init_database.py`
 - After initial setup, the backend operates completely independently of CSV files
 - All user interactions modify the database directly
-- The database can be backed up by simply copying `reland.db` file
+- The database should be backed up using PostgreSQL backup tools (pg_dump)
 
 ## Next Steps for Re-running Predictions
 

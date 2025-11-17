@@ -25,6 +25,10 @@ reland.db
 reland-backend/*.db
 reland-backend/reland.db
 
+# Environment variables (contain sensitive data)
+.env
+reland-backend/.env
+
 # CSV files (contain confidential data)
 *.csv
 reland-backend/*.csv

@@ -178,26 +178,73 @@ function App() {
           if (!points || points.length === 0) return points;
           
           // Find min and max risk scores (use risk_score field from new backend)
-          const scores = points.map(p => p.risk_score || p.sonson_avg || 0).filter(s => !isNaN(s) && isFinite(s));
-          if (scores.length === 0) return points;
+          const scores = points.map(p => {
+            const score = p.risk_score || p.sonson_avg || 0;
+            return !isNaN(score) && isFinite(score) && score > 0 ? score : null;
+          }).filter(s => s !== null);
+          
+          if (scores.length === 0) {
+            // No valid scores, assign all as low risk (cyan)
+            return points.map(p => ({
+              ...p,
+              risk_score_normalized: 0,
+              sonson_avg_normalized: 0
+            }));
+          }
           
           const minScore = Math.min(...scores);
           const maxScore = Math.max(...scores);
           const range = maxScore - minScore;
           
-          console.log(`Risk score range: ${minScore} to ${maxScore}`);
+          // Debug summary (only log once, not per point)
+          const normalizedSamples = [];
+          const sampleCount = Math.min(5, points.length);
           
           // Normalize to 0-1 range
-          return points.map(p => ({
-            ...p,
-            risk_score_normalized: range > 0 
-              ? ((p.risk_score || p.sonson_avg || 0) - minScore) / range 
-              : (p.risk_score || p.sonson_avg || 0),
-            // Keep sonson_avg_normalized for backward compatibility with layer styles
-            sonson_avg_normalized: range > 0 
-              ? ((p.risk_score || p.sonson_avg || 0) - minScore) / range 
-              : (p.risk_score || p.sonson_avg || 0)
-          }));
+          // If all scores are the same (range = 0), assign all as low risk (0)
+          const normalizedPoints = points.map((p, idx) => {
+            const score = p.risk_score || p.sonson_avg || 0;
+            
+            // Handle edge cases
+            if (!isFinite(score) || score <= 0) {
+              return {
+                ...p,
+                risk_score_normalized: 0,
+                sonson_avg_normalized: 0
+              };
+            }
+            
+            let normalized;
+            if (range <= 0 || Math.abs(range) < 1e-10) {
+              // All scores are the same - treat as low risk
+              normalized = 0;
+            } else {
+              // Normalize: (score - min) / range
+              normalized = Math.max(0, Math.min(1, (score - minScore) / range));
+            }
+            
+            // Collect samples for debugging
+            if (idx < sampleCount) {
+              normalizedSamples.push({ score, normalized });
+            }
+            
+            return {
+              ...p,
+              risk_score_normalized: normalized,
+              sonson_avg_normalized: normalized
+            };
+          });
+          
+          // Log summary once
+          console.log(`Risk normalization:`, {
+            minScore,
+            maxScore,
+            range,
+            pointsCount: points.length,
+            samples: normalizedSamples
+          });
+          
+          return normalizedPoints;
         };
         
         // We need to format this data into GeoJSON, the standard for maps
@@ -218,6 +265,16 @@ function App() {
         const normalizedHeatmapPoints = normalizeRiskScores(heatmapPoints);
         const heatmapGeoJSON = toGeoJSON(normalizedHeatmapPoints);
         console.log("Heatmap GeoJSON created:", heatmapGeoJSON ? `${heatmapGeoJSON.features.length} features` : "null");
+        
+        // Debug: Check normalized values in GeoJSON
+        if (heatmapGeoJSON && heatmapGeoJSON.features.length > 0) {
+          const sampleProps = heatmapGeoJSON.features.slice(0, 5).map(f => ({
+            risk_score: f.properties.risk_score,
+            sonson_avg_normalized: f.properties.sonson_avg_normalized,
+            risk_score_normalized: f.properties.risk_score_normalized
+          }));
+          console.log("Sample normalized values in GeoJSON:", sampleProps);
+        }
         
         setPredictionData(heatmapGeoJSON);
         setHistoricalData(toGeoJSON(data.historical_points || []));

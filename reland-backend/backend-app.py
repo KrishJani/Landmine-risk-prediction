@@ -4,15 +4,29 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from datetime import datetime
 from math import isfinite
+from dotenv import load_dotenv
 from models import db, Location, UserLabel, ConfirmedEvent
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# Database configuration
-basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(basedir, "reland.db")}'
+# Database configuration - PostgreSQL
+DATABASE_URL = os.getenv('DATABASE_URL')
+if not DATABASE_URL:
+    raise ValueError(
+        "DATABASE_URL environment variable is not set. "
+        "Please create a .env file with DATABASE_URL=postgresql://user:password@localhost:5432/reland_db"
+    )
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,  # Verify connections before using
+    'pool_recycle': 300,    # Recycle connections after 5 minutes
+}
 
 # Initialize database
 db.init_app(app)
@@ -120,15 +134,35 @@ def get_map_data():
     
     risk_levels = calculate_risk_levels(locations, score_to_use)
     
+    # Debug: Check actual risk score values
+    all_scores = [getattr(loc, score_to_use, None) or loc.risk_score_lr for loc in locations if getattr(loc, score_to_use, None) or loc.risk_score_lr]
+    valid_scores = [s for s in all_scores if s is not None and isfinite(s)]
+    
+    if valid_scores:
+        sorted_scores = sorted(valid_scores)
+        print(f"\n📊 Risk Score Statistics (for {len(valid_scores)} locations):")
+        print(f"   Min: {sorted_scores[0]}")
+        print(f"   25th percentile: {sorted_scores[len(sorted_scores)//4]}")
+        print(f"   50th percentile (median): {sorted_scores[len(sorted_scores)//2]}")
+        print(f"   75th percentile: {sorted_scores[3*len(sorted_scores)//4]}")
+        print(f"   Max: {sorted_scores[-1]}")
+        print(f"   Range: {sorted_scores[-1] - sorted_scores[0]}")
+        if len(set(valid_scores)) == 1:
+            print(f"   ⚠️  WARNING: All scores are identical ({valid_scores[0]})")
+    
     risk_points = []
     for location in locations:
         risk_level = risk_levels.get(location.id, 'Low')
         risk_score = getattr(location, score_to_use, None) or location.risk_score_lr
         
+        # Ensure we have a valid numeric score
+        if risk_score is None or not isfinite(risk_score):
+            risk_score = 0.0
+        
         risk_points.append({
             'LATITUD_Y': location.lat,
             'LONGITUD_X': location.lon,
-            'risk_score': float(risk_score) if risk_score is not None and isfinite(risk_score) else 0.0,
+            'risk_score': float(risk_score),
             'risk_level': risk_level,
             'color': get_color_for_risk_level(risk_level),
             'location_id': location.id,
@@ -522,7 +556,19 @@ if __name__ == '__main__':
         print("\n" + "="*50)
         print("🚀 RELand Backend Server")
         print("="*50)
-        print(f"💾 Database: {app.config['SQLALCHEMY_DATABASE_URI']}")
+        # Mask password in connection string for security
+        db_url = app.config['SQLALCHEMY_DATABASE_URI']
+        if '@' in db_url:
+            # Mask password: postgresql://user:password@host -> postgresql://user:***@host
+            parts = db_url.split('@')
+            if len(parts) == 2:
+                user_part = parts[0].rsplit('/', 1)[0] + '/***'
+                db_url_display = user_part + '@' + parts[1]
+            else:
+                db_url_display = db_url
+        else:
+            db_url_display = db_url
+        print(f"💾 Database: {db_url_display}")
         print(f"📊 Stats: {location_count} locations, {area_count} areas, {label_count} labels, {event_count} events")
         print(f"🌐 Running on: http://localhost:5001")
         print("="*50 + "\n")
