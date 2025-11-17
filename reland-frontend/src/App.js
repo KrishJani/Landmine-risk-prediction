@@ -571,7 +571,69 @@ function App() {
     
     fetchConfirmedEvents();
   }, []);
-  
+
+  // Handler to load custom icons when map loads
+  const handleMapLoad = () => {
+    if (!mapRef.current) return;
+    
+    const map = mapRef.current.getMap();
+    
+    // Create square icon template (SVG)
+    const squareSvgTemplate = (color) => `
+      <svg width="20" height="20" xmlns="http://www.w3.org/2000/svg">
+        <rect width="20" height="20" fill="${color}" stroke="white" stroke-width="1"/>
+      </svg>
+    `;
+    
+    // Create triangle icon template (SVG)
+    const triangleSvgTemplate = (color) => `
+      <svg width="20" height="20" xmlns="http://www.w3.org/2000/svg">
+        <polygon points="10,2 18,18 2,18" fill="${color}" stroke="white" stroke-width="1"/>
+      </svg>
+    `;
+    
+    // Create red triangle for confirmed events
+    const redTriangleSvg = triangleSvgTemplate('#ff0000');
+    const triangleImg = new Image();
+    triangleImg.onload = () => {
+      if (map.hasImage('triangle-marker')) {
+        map.removeImage('triangle-marker');
+      }
+      map.addImage('triangle-marker', triangleImg);
+    };
+    triangleImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(redTriangleSvg);
+    
+    // Create colored square icons for different risk levels
+    const squareColors = {
+      'low': 'rgb(28,238,238)',    // Cyan
+      'medium': 'yellow',           // Yellow
+      'high': 'red'                 // Red
+    };
+    
+    Object.entries(squareColors).forEach(([level, color]) => {
+      const squareSvg = squareSvgTemplate(color);
+      const squareImg = new Image();
+      squareImg.onload = () => {
+        const iconName = `square-${level}`;
+        if (map.hasImage(iconName)) {
+          map.removeImage(iconName);
+        }
+        map.addImage(iconName, squareImg);
+      };
+      squareImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(squareSvg);
+    });
+    
+    // Create a default square icon as fallback
+    const defaultSquareSvg = squareSvgTemplate('#888888');
+    const defaultSquareImg = new Image();
+    defaultSquareImg.onload = () => {
+      if (map.hasImage('square-marker')) {
+        map.removeImage('square-marker');
+      }
+      map.addImage('square-marker', defaultSquareImg);
+    };
+    defaultSquareImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(defaultSquareSvg);
+  };
 
   // --- JSX (The UI Rendering) ---
   // This is the React equivalent of your 'app.layout'
@@ -721,6 +783,7 @@ function App() {
         <Map
           ref={mapRef}
           {...viewport} // Spread the viewport state
+          onLoad={handleMapLoad}
           onMove={evt => setViewport(evt.viewState)} // Update state on move
           onMouseMove={(evt) => {
             // Query features at mouse position using the map instance
@@ -752,38 +815,31 @@ function App() {
           {/* --- Map Data Layers --- */}
           {/* We only render the Source and Layer if the data exists */}
           
-          {/* 1. Prediction Layer - Heatmap */}
-          {showPrediction && predictionData && (
-            <Source type="geojson" data={predictionData}>
-              <Layer {...predictionLayerStyle} />
-            </Source>
-          )}
-          
-          {/* 1b. Prediction Layer - Circle Points (for hover interaction) */}
+          {/* 1. Prediction Layer - Square Points */}
           {showPrediction && predictionData && (
             <Source type="geojson" data={predictionData}>
               <Layer
                 id="prediction-points"
-                type="circle"
+                type="symbol"
+                layout={{
+                  'icon-image': [
+                    'case',
+                    ['<', ['get', 'sonson_avg_normalized'], 0.33], 'square-low',
+                    ['<', ['get', 'sonson_avg_normalized'], 0.67], 'square-medium',
+                    'square-high'
+                  ],
+                  'icon-size': [
+                    'interpolate',
+                    ['linear'],
+                    ['get', 'sonson_avg_normalized'],
+                    0, 0.4,
+                    1, 1.0
+                  ],
+                  'icon-allow-overlap': true,
+                  'icon-ignore-placement': true
+                }}
                 paint={{
-                  'circle-radius': [
-                    'interpolate',
-                    ['linear'],
-                    ['get', 'sonson_avg_normalized'],
-                    0, 3,
-                    1, 8
-                  ],
-                  'circle-color': [
-                    'interpolate',
-                    ['linear'],
-                    ['get', 'sonson_avg_normalized'],
-                    0, 'rgb(28,238,238)', // Cyan (low risk)
-                    0.5, 'yellow',        // Yellow (mid risk)
-                    1, 'red'               // Red (high risk)
-                  ],
-                  'circle-opacity': 0.6,
-                  'circle-stroke-width': 1,
-                  'circle-stroke-color': '#fff'
+                  'icon-opacity': 0.8
                 }}
               />
             </Source>
@@ -828,13 +884,15 @@ function App() {
             }}>
               <Layer
                 id="confirmed-events"
-                type="circle"
+                type="symbol"
+                layout={{
+                  'icon-image': 'triangle-marker',
+                  'icon-size': 1.0,
+                  'icon-allow-overlap': true,
+                  'icon-ignore-placement': true
+                }}
                 paint={{
-                  'circle-radius': 8,
-                  'circle-color': '#ff0000',
-                  'circle-opacity': 0.8,
-                  'circle-stroke-width': 2,
-                  'circle-stroke-color': '#ffffff'
+                  'icon-opacity': 0.8
                 }}
               />
             </Source>
