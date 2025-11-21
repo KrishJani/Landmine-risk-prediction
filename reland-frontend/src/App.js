@@ -125,6 +125,9 @@ function App() {
   const [isStyleLoading, setIsStyleLoading] = useState(false);
   const [mapReady, setMapReady] = useState(false);
 
+  // Edit mode state: 'none', 'labels', or 'events'
+  const [editMode, setEditMode] = useState('none');
+
   
   // --- Data Fetching (Side Effects) ---
   
@@ -421,13 +424,40 @@ function App() {
 
   // Label management handlers
   const handlePointClick = (evt) => {
-    if (mapRef.current) {
-      const map = mapRef.current.getMap();
+    if (!mapRef.current) return;
+
+    // If edit mode is 'none', don't handle clicks
+    if (editMode === 'none') return;
+
+    const map = mapRef.current.getMap();
+    const lngLat = evt.lngLat;
+
+    // Check if clicked on confirmed events layer (for removal)
+    if (editMode === 'events') {
+      const eventFeatures = map.queryRenderedFeatures(evt.point, {
+        layers: ['confirmed-events']
+      });
+      
+      if (eventFeatures.length > 0) {
+        // Clicked on an existing event - remove it
+        const event = eventFeatures[0].properties;
+        handleDeleteEvent(event.id);
+        return;
+      } else {
+        // Clicked on empty space - add new event
+        handleAddEventFromMap(lngLat.lat, lngLat.lng);
+        return;
+      }
+    }
+
+    // Labels mode: handle label editing
+    if (editMode === 'labels') {
       const features = map.queryRenderedFeatures(evt.point, {
         layers: ['prediction-points']
       });
       
       if (features.length > 0) {
+        // Clicked on a prediction point (centroid)
         const feature = features[0];
         const point = feature.properties;
         setSelectedPoint(point);
@@ -453,7 +483,6 @@ function App() {
         setShowLabelDialog(true);
       } else {
         // Clicked on empty space - allow manual entry
-        const lngLat = evt.lngLat;
         setSelectedPoint(null);
         setLabelForm({ 
           label: null, 
@@ -465,6 +494,64 @@ function App() {
         setShowLabelDialog(true);
       }
     }
+  };
+
+  // Add confirmed event from map click
+  const handleAddEventFromMap = async (lat, lon) => {
+    // Try to find municipality from nearby prediction points
+    let municipio = 'Unknown';
+    
+    if (predictionData && predictionData.features) {
+      // Find the closest prediction point to get municipality
+      let minDistance = Infinity;
+      let closestPoint = null;
+      
+      predictionData.features.forEach(feature => {
+        const pointLat = feature.properties.LATITUD_Y;
+        const pointLon = feature.properties.LONGITUD_X;
+        if (pointLat && pointLon) {
+          // Simple distance calculation (Haversine would be better but this works for nearby points)
+          const distance = Math.sqrt(
+            Math.pow(lat - pointLat, 2) + Math.pow(lon - pointLon, 2)
+          );
+          if (distance < minDistance) {
+            minDistance = distance;
+            closestPoint = feature.properties;
+          }
+        }
+      });
+      
+      if (closestPoint && closestPoint.Municipio) {
+        municipio = closestPoint.Municipio;
+      }
+    }
+    
+    fetch('http://localhost:5001/api/confirmed_events', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        lat: lat,
+        lon: lon,
+        municipio: municipio,
+        source: 'manual',
+        description: 'Added from map click'
+      })
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          setConfirmedEvents([...confirmedEvents, data]);
+          alert('Confirmed event added successfully!');
+        }
+      })
+      .catch(err => {
+        console.error('Error adding event:', err);
+        alert('Error adding event. Please try again.');
+      });
   };
 
   const handleSaveLabel = () => {
@@ -833,6 +920,67 @@ function App() {
         </div>
 
         <div className="control-group">
+          <strong>Edit Mode</strong>
+          <div style={{ marginBottom: '10px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', marginBottom: '8px', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="editMode"
+                value="none"
+                checked={editMode === 'none'}
+                onChange={(e) => setEditMode(e.target.value)}
+                style={{ marginRight: '8px' }}
+              />
+              <span>None (View Only)</span>
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', marginBottom: '8px', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="editMode"
+                value="labels"
+                checked={editMode === 'labels'}
+                onChange={(e) => setEditMode(e.target.value)}
+                style={{ marginRight: '8px' }}
+              />
+              <span>Edit Labels</span>
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="editMode"
+                value="events"
+                checked={editMode === 'events'}
+                onChange={(e) => setEditMode(e.target.value)}
+                style={{ marginRight: '8px' }}
+              />
+              <span>Edit Confirmed Events</span>
+            </label>
+          </div>
+          {editMode === 'labels' && (
+            <div style={{ 
+              padding: '10px', 
+              backgroundColor: '#e7f3ff', 
+              borderRadius: '4px', 
+              fontSize: '12px',
+              marginTop: '5px'
+            }}>
+              Click on a prediction point (centroid) to add/edit labels
+            </div>
+          )}
+          {editMode === 'events' && (
+            <div style={{ 
+              padding: '10px', 
+              backgroundColor: '#fff3cd', 
+              borderRadius: '4px', 
+              fontSize: '12px',
+              marginTop: '5px'
+            }}>
+              Click on map to add event, click on existing event to remove
+            </div>
+          )}
+        </div>
+
+        <div className="control-group">
           <strong>Data Management</strong>
           <button 
             onClick={() => {
@@ -941,10 +1089,24 @@ function App() {
           {...viewport} // Spread the viewport state
           onLoad={handleMapLoad}
           onMove={evt => setViewport(evt.viewState)} // Update state on move
+          cursor={editMode !== 'none' ? 'crosshair' : 'default'}
           onMouseMove={(evt) => {
             // Query features at mouse position using the map instance
             if (mapRef.current) {
               const map = mapRef.current.getMap();
+              
+              // In events mode, check for events first
+              if (editMode === 'events') {
+                const eventFeatures = map.queryRenderedFeatures(evt.point, {
+                  layers: ['confirmed-events']
+                });
+                if (eventFeatures.length > 0) {
+                  // Change cursor to indicate clickable
+                  map.getCanvas().style.cursor = 'pointer';
+                  return;
+                }
+              }
+              
               const features = map.queryRenderedFeatures(evt.point, {
                 layers: ['prediction-points']
               });
@@ -953,8 +1115,14 @@ function App() {
                 const feature = features[0];
                 setHoveredPoint(feature.properties);
                 setHoverPosition({ x: evt.point.x, y: evt.point.y });
+                if (editMode === 'labels') {
+                  map.getCanvas().style.cursor = 'pointer';
+                }
               } else {
                 setHoveredPoint(null);
+                if (editMode !== 'none') {
+                  map.getCanvas().style.cursor = 'crosshair';
+                }
               }
             }
           }}
@@ -1065,13 +1233,13 @@ function App() {
               key={`events-${mapStyle}`}
               type="geojson" 
               data={{
-              type: 'FeatureCollection',
-              features: confirmedEvents.map(event => ({
-                type: 'Feature',
-                geometry: { type: 'Point', coordinates: [event.lon, event.lat] },
-                properties: event
-              }))
-            }}>
+                type: 'FeatureCollection',
+                features: confirmedEvents.map(event => ({
+                  type: 'Feature',
+                  geometry: { type: 'Point', coordinates: [event.lon, event.lat] },
+                  properties: event
+                }))
+              }}>
               <Layer
                 id="confirmed-events"
                 type="symbol"
@@ -1082,7 +1250,7 @@ function App() {
                   'icon-ignore-placement': true
                 }}
                 paint={{
-                  'icon-opacity': 0.8
+                  'icon-opacity': editMode === 'events' ? 1.0 : 0.8
                 }}
               />
             </Source>
