@@ -121,6 +121,10 @@ function App() {
     useManualCoords: false 
   });
 
+  // Loading state for map style changes
+  const [isStyleLoading, setIsStyleLoading] = useState(false);
+  const [mapReady, setMapReady] = useState(false);
+
   
   // --- Data Fetching (Side Effects) ---
   
@@ -626,13 +630,7 @@ function App() {
     // Wait for style to be loaded before adding images
     if (!map.isStyleLoaded()) {
       // If style not loaded, wait for it
-      const handleStyleLoad = () => {
-        // Wait a bit more to ensure style is fully ready
-        setTimeout(() => {
-          loadCustomIcons();
-        }, 200);
-      };
-      map.once('style.load', handleStyleLoad);
+      map.once('style.load', loadCustomIcons);
       return;
     }
     
@@ -702,35 +700,56 @@ function App() {
   // Handler to load custom icons when map loads
   const handleMapLoad = useCallback(() => {
     loadCustomIcons();
+    setIsStyleLoading(false); // Ensure loading is off on initial load
+    setMapReady(true); // Mark map as ready
   }, [loadCustomIcons]);
 
-  // Re-load icons when map style changes (using useEffect as backup)
+  // Handle style changes with useEffect to track mapStyle changes
   useEffect(() => {
-    if (!mapRef.current) return;
+    // Don't run until map is ready (skip initial mount)
+    if (!mapReady || !mapRef.current) return;
     
     const map = mapRef.current.getMap();
+    if (!map) return;
     
-    // Small delay to ensure map style has changed
+    // Set loading immediately when style changes
+    setIsStyleLoading(true);
+    
+    const handleStyleLoad = () => {
+      loadCustomIcons();
+      setIsStyleLoading(false);
+    };
+    
+    // Check if style is already loaded (might happen on fast changes)
+    if (map.isStyleLoaded()) {
+      // Small delay to ensure everything is ready
+      const timeoutId = setTimeout(() => {
+        loadCustomIcons();
+        setIsStyleLoading(false);
+      }, 100);
+      return () => clearTimeout(timeoutId);
+    }
+    
+    // Wait for style to load
+    map.once('style.load', handleStyleLoad);
+    
+    // Fallback timeout in case event doesn't fire
     const timeoutId = setTimeout(() => {
       if (map.isStyleLoaded()) {
         loadCustomIcons();
+        setIsStyleLoading(false);
       } else {
-        // Wait for style to load
-        const waitForStyle = () => {
-          if (map.isStyleLoaded()) {
-            loadCustomIcons();
-          } else {
-            map.once('style.load', waitForStyle);
-          }
-        };
-        waitForStyle();
+        // If still not loaded after 3 seconds, hide loading anyway
+        console.warn('Style load timeout - hiding loading indicator');
+        setIsStyleLoading(false);
       }
-    }, 300);
+    }, 3000);
     
     return () => {
       clearTimeout(timeoutId);
+      map.off('style.load', handleStyleLoad);
     };
-  }, [mapStyle, loadCustomIcons]);
+  }, [mapStyle, mapReady, loadCustomIcons]);
 
   // --- JSX (The UI Rendering) ---
   // This is the React equivalent of your 'app.layout'
@@ -744,7 +763,13 @@ function App() {
         
         <div className="control-group">
           <strong>Map Style</strong>
-          <select value={mapStyle} onChange={e => setMapStyle(e.target.value)}>
+          <select 
+            value={mapStyle} 
+            onChange={e => {
+              setIsStyleLoading(true);
+              setMapStyle(e.target.value);
+            }}
+          >
             <option value="streets-v11">Street</option>
             <option value="satellite-streets-v11">Satellite Streets</option>
             <option value="outdoors-v11">Outdoors</option>
@@ -888,16 +913,33 @@ function App() {
           <button onClick={handleSearch}>Find</button>
         </div>
         
+        {/* Loading indicator for map style changes */}
+        {isStyleLoading && (
+          <div style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            background: 'rgba(255, 255, 255, 0.95)',
+            padding: '20px 30px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: 2000,
+            fontSize: '16px',
+            fontWeight: '500',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px'
+          }}>
+            <div className="spinner"></div>
+            Loading map style...
+          </div>
+        )}
+        
         <Map
           ref={mapRef}
           {...viewport} // Spread the viewport state
           onLoad={handleMapLoad}
-          onStyleData={() => {
-            // Delay to ensure style is fully loaded
-            setTimeout(() => {
-              loadCustomIcons();
-            }, 100);
-          }}
           onMove={evt => setViewport(evt.viewState)} // Update state on move
           onMouseMove={(evt) => {
             // Query features at mouse position using the map instance
@@ -931,7 +973,11 @@ function App() {
           
           {/* 1. Prediction Layer - Square Points */}
           {showPrediction && predictionData && (
-            <Source type="geojson" data={predictionData}>
+            <Source 
+              key={`prediction-${mapStyle}`}
+              type="geojson" 
+              data={predictionData}
+            >
               <Layer
                 id="prediction-points"
                 type="symbol"
@@ -988,7 +1034,11 @@ function App() {
 
           {/* 2.5. Municipality Borders Layer */}
           {showMunicipalityBorders && municipalityBorders && (
-            <Source type="geojson" data={municipalityBorders}>
+            <Source 
+              key={`borders-${mapStyle}`}
+              type="geojson" 
+              data={municipalityBorders}
+            >
               <Layer
                 id="municipality-borders-fill"
                 type="fill"
@@ -1011,7 +1061,10 @@ function App() {
 
           {/* 3. Confirmed Events Layer - Only show if checkbox is checked */}
           {showConfirmedEvents && confirmedEvents.length > 0 && (
-            <Source type="geojson" data={{
+            <Source 
+              key={`events-${mapStyle}`}
+              type="geojson" 
+              data={{
               type: 'FeatureCollection',
               features: confirmedEvents.map(event => ({
                 type: 'Feature',
