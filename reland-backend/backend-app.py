@@ -323,9 +323,16 @@ def add_label():
         existing_label = UserLabel.query.filter_by(location_id=location.id).first()
         
         if existing_label:
+            # Check if label is being changed from 1 to 0
+            old_label = existing_label.label
             existing_label.label = label
             existing_label.notes = notes
             existing_label.updated_at = datetime.utcnow()
+            
+            # If changing from 1 to 0, remove the confirmed event
+            if old_label == 1 and label == 0:
+                _remove_confirmed_event_from_label(location.id)
+            
             db.session.commit()
             
             if label == 1:
@@ -579,6 +586,18 @@ def _ensure_confirmed_event(location_id, location):
             description='Confirmed mine event from user label'
         )
         db.session.add(event)
+        db.session.commit()
+
+
+def _remove_confirmed_event_from_label(location_id):
+    """Helper function to remove confirmed event when label is changed from 1 to 0"""
+    existing_event = ConfirmedEvent.query.filter_by(
+        location_id=location_id,
+        source='user_label'
+    ).first()
+    
+    if existing_event:
+        db.session.delete(existing_event)
         db.session.commit()
 
 

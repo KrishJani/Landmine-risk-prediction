@@ -526,6 +526,17 @@ function App() {
       }
     }
     
+    // Show confirmation dialog with event details
+    const confirmMessage = `Add Confirmed Event?\n\n` +
+      `Location: (${lat.toFixed(6)}, ${lon.toFixed(6)})\n` +
+      `Municipio: ${municipio}\n` +
+      `Source: Manual\n` +
+      `Description: Added from map click`;
+    
+    if (!window.confirm(confirmMessage)) {
+      return; // User cancelled
+    }
+    
     fetch('http://localhost:5001/api/confirmed_events', {
       method: 'POST',
       headers: {
@@ -611,10 +622,8 @@ function App() {
             setUserLabels([...userLabels, data]);
           }
           
-          // If label is 1, refresh confirmed events
-          if (data.label === 1) {
-            fetchConfirmedEvents();
-          }
+          // Refresh confirmed events if label changed (either to 1 or from 1 to 0)
+          fetchConfirmedEvents();
           
           setShowLabelDialog(false);
           setSelectedPoint(null);
@@ -950,7 +959,13 @@ function App() {
                 name="editMode"
                 value="events"
                 checked={editMode === 'events'}
-                onChange={(e) => setEditMode(e.target.value)}
+                onChange={(e) => {
+                  setEditMode(e.target.value);
+                  // Auto-enable confirmed events visibility when entering events edit mode
+                  if (e.target.value === 'events') {
+                    setShowConfirmedEvents(true);
+                  }
+                }}
                 style={{ marginRight: '8px' }}
               />
               <span>Edit Confirmed Events</span>
@@ -1298,7 +1313,7 @@ function App() {
                 <strong>Municipio:</strong> {hoveredPoint.Municipio}
               </div>
             )}
-            {hoveredPoint.location_id && (
+            {hoveredPoint.location_id && editMode !== 'none' && (
               <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #ddd' }}>
                 <button
                   onClick={(e) => {
