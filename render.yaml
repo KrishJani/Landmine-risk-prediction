@@ -2,6 +2,7 @@ services:
   - type: web
     name: reland-backend
     env: python
+    plan: free
     rootDir: reland-backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn backend-app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
@@ -16,6 +17,7 @@ services:
   - type: worker
     name: reland-worker
     env: python
+    plan: free
     rootDir: reland-backend
     buildCommand: pip install -r requirements.txt
     startCommand: python worker.py
