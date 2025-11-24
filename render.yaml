@@ -21,9 +21,9 @@ services:
     startCommand: python worker.py
     envVars:
       - key: DATABASE_URL
-        fromService: reland-backend
-        name: DATABASE_URL
+        sync: false
       - key: REDIS_URL
-        fromService: reland-backend
-        name: REDIS_URL
+        sync: false
+      - key: FLASK_ENV
+        value: production
 
