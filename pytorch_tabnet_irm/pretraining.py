@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-import tab_network
+from . import tab_network
 from .utils import (
     create_explain_matrix,
     filter_weights,

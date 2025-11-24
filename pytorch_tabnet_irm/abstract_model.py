@@ -7,9 +7,10 @@ from scipy.sparse import csc_matrix
 from abc import abstractmethod
 
 import sys
-sys.path.append('/home/siqiz/Landmine/pytorch_tabnet_irm')
+# Remove hardcoded path - use relative import instead
+# sys.path.append('/home/siqiz/Landmine/pytorch_tabnet_irm')
 
-import tab_network
+from . import tab_network
 from .utils import (
     PredictDataset,
     create_explain_matrix,

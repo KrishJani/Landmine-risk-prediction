@@ -66,7 +66,7 @@ class IRMLoss(nn.Module):
 
     def penalty(self, logits, y):
         # penalty use full dataset
-        scale = torch.tensor(1.).cuda().requires_grad_()
+        scale = torch.tensor(1., device=logits.device).requires_grad_()
         loss = self.mean_nll(logits * scale, y)
         grad = autograd.grad(loss, [scale], create_graph=True)[0]
         return torch.sum(grad**2)

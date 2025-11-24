@@ -291,7 +291,7 @@ if __name__ == "__main__":
     # python main.py 2>&1 | tee ./experiments/[your timestamp]/log.txt
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timestamp", help=r'unique experiment id, hint: datetime.now().strftime("%m%d%Y%H%M%S")') 
+    parser.add_argument("--timestamp", help=r'unique experiment id, hint: datetime.now().strftime("%%m%%d%%Y%%H%%M%%S")') 
     parser.add_argument("--municipio", required=True, help='directory with train test split info')
     parser.add_argument("--subset", required=True, help='single | geo | full')
     parser.add_argument("--model", required=True, help='TabCmpt | MLP | TabNet | LR | RF | SVM | LGBM')

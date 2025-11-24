@@ -64,7 +64,7 @@ class RELand():
                 hist_mine = hist_mine.to(self.device)
                 self.optimizer.zero_grad()
 
-                weight_norm = torch.tensor(0.).cuda()
+                weight_norm = torch.tensor(0.).to(self.device)
                 for k, param in self.model.state_dict().items():
                     if (param.requires_grad) \
                         and (k != 'attentive_transformer.0.weights') \

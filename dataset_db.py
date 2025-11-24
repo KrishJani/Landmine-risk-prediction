@@ -8,31 +8,110 @@ import torch
 from torch.utils.data import Dataset
 
 from typing import *
+import os
+from sqlalchemy import create_engine, func
 
-class Event(Dataset):
+class EventDB(Dataset):
+    """
+    Hybrid dataset class that loads static features from CSV and dynamic features from database.
+    This provides the best performance: fast CSV reading + dynamic database updates.
+    """
     def __init__(self, 
                  train_municipios : List[str], val_municipio : str, 
-                 subset : str, split : str):
+                 subset : str, split : str,
+                 db_url : str = None):
         """
-        Landmine dataset class.
+        Landmine dataset class with database integration.
 
         Args:
             train_municipios (List[str]) : training municipalities. If split != 'train', load for normalization.
             val_munipio (str) : the validation municipality.
             subset (str): full | geo | single
             split (str) : train | val
+            db_url (str): Database connection string. If None, reads from DATABASE_URL env var.
         """ 
         self.split = split
         self.val_municipio = val_municipio
         
-        data_path = './processed_dataset/resolution_0.5.csv' # combined full dataset
+        # Get database URL
+        if db_url is None:
+            db_url = os.getenv('DATABASE_URL')
+        if not db_url:
+            raise ValueError("DATABASE_URL environment variable not set")
+        
+        # Load static features from CSV (fast, one-time read)
+        data_path = './processed_dataset/resolution_0.5.csv'
+        print(f"Loading static features from CSV: {data_path}")
         data = pd.read_csv(data_path)
+        print(f"  Loaded {len(data)} rows from CSV")
+        
+        # Load dynamic features from database (only dist_old_mine)
+        print("Loading dynamic features from database...")
+        engine = create_engine(db_url)
+        db_query = """
+            SELECT 
+                l.lon as LONGITUD_X,
+                l.lat as LATITUD_Y,
+                l.dist_old_mine,
+                COALESCE(ul.label, 0) as mines_outcome_db
+            FROM locations l
+            LEFT JOIN user_labels ul ON l.id = ul.location_id AND ul.label = 1
+        """
+        db_data = pd.read_sql(db_query, engine)
+        print(f"  Loaded {len(db_data)} rows from database")
+        
+        # Merge database data with CSV data on coordinates
+        # Use a tolerance for coordinate matching (0.0001 degrees ≈ 11 meters)
+        print("Merging CSV and database data...")
+        data['merge_key'] = data.apply(
+            lambda row: f"{row['LONGITUD_X']:.6f}_{row['LATITUD_Y']:.6f}", axis=1
+        )
+        db_data['merge_key'] = db_data.apply(
+            lambda row: f"{row['LONGITUD_X']:.6f}_{row['LATITUD_Y']:.6f}", axis=1
+        )
+        
+        # Merge on coordinates
+        merged = data.merge(
+            db_data[['merge_key', 'dist_old_mine', 'mines_outcome_db']],
+            on='merge_key',
+            how='left',
+            suffixes=('_csv', '_db')
+        )
+        
+        # Update dist_old_mine from database if available, otherwise keep CSV value
+        if 'dist_old_mine_db' in merged.columns:
+            # Use database value if available, otherwise use CSV value
+            if 'dist_old_mine_csv' in merged.columns:
+                merged['dist_old_mine'] = merged['dist_old_mine_db'].fillna(merged['dist_old_mine_csv'])
+                merged = merged.drop(columns=['dist_old_mine_csv'], errors='ignore')
+            else:
+                # CSV doesn't have dist_old_mine, use DB value
+                merged['dist_old_mine'] = merged['dist_old_mine_db']
+            # Drop the DB column
+            merged = merged.drop(columns=['dist_old_mine_db'], errors='ignore')
+        elif 'dist_old_mine_csv' in merged.columns:
+            # No DB column, keep CSV value
+            merged['dist_old_mine'] = merged['dist_old_mine_csv']
+            merged = merged.drop(columns=['dist_old_mine_csv'], errors='ignore')
+        # If neither exists, dist_old_mine column will be missing (will be handled by feature selection)
+        
+        # Use database labels if available, otherwise use CSV labels
+        if 'mines_outcome_db' in merged.columns:
+            # Only update if database has a label (1), otherwise keep CSV value
+            merged['mines_outcome'] = merged.apply(
+                lambda row: row['mines_outcome_db'] if pd.notna(row['mines_outcome_db']) and row['mines_outcome_db'] == 1 
+                           else row['mines_outcome'], axis=1
+            )
+            merged = merged.drop(columns=['mines_outcome_db'])
+        
+        data = merged.drop(columns=['merge_key'], errors='ignore')
+        
+        print(f"  Merged data: {len(data)} rows")
         
         all_locations = data[['LONGITUD_X','LATITUD_Y']].to_numpy()
         all_hist_mine = data['0.5km_hist_mines'].to_numpy()
         
         if subset == 'full':
-
             self.numeric_cols = ['airports_dist','seaport_dist', 'settlement_dist', 'finance_dist', 'edu_dist',
                                 'buildings_dist', 'waterways_dist', 'rwi', 'elevation',
                                 'roads_dist', 'No. Víctimas por Declaración',
@@ -60,7 +139,6 @@ class Event(Dataset):
                                 'relief_Terrazas y abanicos terrazas', 'relief_Vallecitos',
                                 'relief_Vallecitos coluvio-aluviales', 'relief_Zona urbana']
         elif subset == 'geo':
-
             self.numeric_cols = ['airports_dist','seaport_dist', 'settlement_dist', 'finance_dist', 'edu_dist',
                                 'buildings_dist', 'waterways_dist', 'rwi', 'elevation',
                                 'roads_dist', 'No. Víctimas por Declaración',
@@ -107,10 +185,6 @@ class Event(Dataset):
             val_tabX = tabX.loc[list(data[data['Municipio'] == val_municipio].index),self.features]
         
         imputer = KNNImputer(n_neighbors = 4, weights = 'distance')
-        # Ensure all columns are numeric before processing
-        train_tabX = train_tabX.apply(pd.to_numeric, errors='coerce')
-        val_tabX = val_tabX.apply(pd.to_numeric, errors='coerce')
-        
         train_imputer = imputer.fit(train_tabX)
         if len(np.where(np.isnan(train_tabX).any(axis=0))[0]) != 0:
             idx = np.where(np.isnan(train_tabX).any(axis=0))[0][0]  # find the nan column
@@ -128,23 +202,23 @@ class Event(Dataset):
                 val_idx = train_tabX_combined.index[~train_tabX_combined.index.isin(train_idx)]
                 self.locations = all_locations[list(val_idx)]
                 self.y = data.loc[val_idx,'mines_outcome'].to_numpy()
-                self.tabX = val_tabX.to_numpy(dtype=np.float32)
+                self.tabX = val_tabX.to_numpy()
                 self.hist_mine = all_hist_mine[list(val_idx)]
             else:
                 self.locations = all_locations[list(data[data['Municipio'] == val_municipio].index)]
                 self.y = (data.loc[data['Municipio'] == val_municipio,'mines_outcome']).to_numpy()
-                self.tabX = val_tabX.to_numpy(dtype=np.float32)
+                self.tabX = val_tabX.to_numpy()
                 self.hist_mine = all_hist_mine[list(data[data['Municipio'] == val_municipio].index)]
         elif self.split == 'train': 
             if val_municipio == 'RANDOM' or val_municipio == 'PUERTO LIBERTADOR' or val_municipio == 'MURINDÓ':
                 self.locations = all_locations[list(train_idx)]
                 self.y = data.loc[train_idx,'mines_outcome'].to_numpy()
-                self.tabX = train_tabX.to_numpy(dtype=np.float32)
+                self.tabX = train_tabX.to_numpy()
                 self.hist_mine = all_hist_mine[list(train_idx)]
             else:
                 self.locations = all_locations[list(data[data['Municipio'].isin(train_municipios)].index)]
                 self.y = (data.loc[data['Municipio'].isin(train_municipios),'mines_outcome']).to_numpy()
-                self.tabX = train_tabX.to_numpy(dtype=np.float32)
+                self.tabX = train_tabX.to_numpy()
                 self.hist_mine = all_hist_mine[list(data[data['Municipio'].isin(train_municipios)].index)]
        
         # for ood bench
@@ -158,18 +232,8 @@ class Event(Dataset):
         hist_mine = self.hist_mine[idx]
         label = self.y[idx]
         tab_data = self.tabX[idx,:]
-        # Ensure tab_data is numeric (convert object dtype to float)
-        # Handle both 1D and 2D arrays
-        if isinstance(tab_data, np.ndarray):
-            if tab_data.dtype == np.object_ or tab_data.dtype == object:
-                # Convert object array to float, handling any non-numeric values
-                tab_data = pd.Series(tab_data).astype(float).values
-            else:
-                tab_data = tab_data.astype(np.float32)
-        else:
-            # If it's not already a numpy array, convert it
-            tab_data = np.array(tab_data, dtype=np.float32)
-        return  (torch.tensor(tab_data, dtype=torch.float32),\
-                torch.tensor(label, dtype=torch.float32), \
-                torch.tensor((lon, lat), dtype=torch.float32), \
-                torch.tensor(hist_mine, dtype=torch.float32))
+        return  (torch.tensor(tab_data).float(),\
+                torch.tensor(label).float(), \
+                torch.tensor((lon, lat)).float(), \
+                torch.tensor(hist_mine).float())
+

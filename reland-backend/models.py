@@ -29,6 +29,7 @@ class Location(db.Model):
     temperature = db.Column(db.Float)
     population_2012 = db.Column(db.Float)
     hist_mines = db.Column(db.Float)
+    dist_old_mine = db.Column(db.Float)  # Distance to closest confirmed event (in km)
     
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow)

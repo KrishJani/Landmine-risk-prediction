@@ -91,7 +91,6 @@ function App() {
   const [showHistorical, setShowHistorical] = useState([]); // Stores [-1, 0, 1]
   const [showClusters, setShowClusters] = useState([]); // Stores [0, 1, 2]
   const [showConfirmedEvents, setShowConfirmedEvents] = useState(false); // Toggle for confirmed events visibility
-  const [showMunicipalityBorders, setShowMunicipalityBorders] = useState(true); // Toggle for municipality borders
   
   // Data state
   const [predictionData, setPredictionData] = useState(null);
@@ -113,12 +112,21 @@ function App() {
   const [selectedPoint, setSelectedPoint] = useState(null); // Point clicked for labeling
   const [showLabelDialog, setShowLabelDialog] = useState(false);
   const [showEventsPanel, setShowEventsPanel] = useState(false);
+  const [showEventDialog, setShowEventDialog] = useState(false);
+  const [editingEvent, setEditingEvent] = useState(null); // Track which event is being edited
   const [labelForm, setLabelForm] = useState({ 
     label: null, 
     notes: '', 
     manualLat: '', 
     manualLon: '',
     useManualCoords: false 
+  });
+  const [eventForm, setEventForm] = useState({
+    lat: '',
+    lon: '',
+    municipio: '',
+    description: '',
+    eventDate: ''
   });
 
   // Loading state for map style changes
@@ -127,6 +135,10 @@ function App() {
 
   // Edit mode state: 'none', 'labels', or 'events'
   const [editMode, setEditMode] = useState('none');
+  
+  // Loading state for recalculation and retraining
+  const [isRecalculating, setIsRecalculating] = useState(false);
+  const [isRetraining, setIsRetraining] = useState(false);
 
   
   // --- Data Fetching (Side Effects) ---
@@ -310,47 +322,44 @@ function App() {
         alert("Error fetching map data from backend.");
       });
     
-    // Fetch municipality borders for selected areas
-    // Only fetch if we have selected areas (don't fetch all borders at once)
+    // Fetch municipality borders - always fetch (for selected areas or all if none selected)
+    const borderParams = new URLSearchParams();
     if (selectedAreas.length > 0) {
-      const borderParams = new URLSearchParams();
       // Send names as-is (backend will handle normalization)
       selectedAreas.forEach(area => {
         if (area && area.toLowerCase() !== 'unknown') {
           borderParams.append('municipalities[]', area);
         }
       });
-      
-      // Only fetch if we have valid areas
-      if (borderParams.toString()) {
-        fetch(`http://localhost:5001/api/municipality_borders?${borderParams.toString()}`)
-          .then(res => {
-            if (!res.ok) {
-              throw new Error(`HTTP error! status: ${res.status}`);
-            }
-            return res.json();
-          })
-          .then(data => {
-            console.log("Municipality borders received:", data);
-            if (data.type === 'FeatureCollection' && data.features && data.features.length > 0) {
-              setMunicipalityBorders(data);
-              console.log(`Loaded ${data.features.length} municipality borders`);
-            } else {
-              console.warn("No municipality borders found for selected areas");
-              setMunicipalityBorders(null);
-            }
-          })
-          .catch(err => {
-            console.error("Error fetching municipality borders:", err);
-            // Don't show alert for borders - it's not critical
-            setMunicipalityBorders(null);
-          });
-      } else {
-        setMunicipalityBorders(null);
-      }
-    } else {
-      setMunicipalityBorders(null);
     }
+    // If no areas selected or no valid areas, fetch all borders (no params = all borders)
+    
+    const borderUrl = borderParams.toString() 
+      ? `http://localhost:5001/api/municipality_borders?${borderParams.toString()}`
+      : 'http://localhost:5001/api/municipality_borders';
+    
+    fetch(borderUrl)
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        console.log("Municipality borders received:", data);
+        if (data.type === 'FeatureCollection' && data.features && data.features.length > 0) {
+          setMunicipalityBorders(data);
+          console.log(`Loaded ${data.features.length} municipality borders`);
+        } else {
+          console.warn("No municipality borders found");
+          setMunicipalityBorders(null);
+        }
+      })
+      .catch(err => {
+        console.error("Error fetching municipality borders:", err);
+        // Don't show alert for borders - it's not critical
+        setMunicipalityBorders(null);
+      });
       
   }, [selectedAreas]); // The "dependency array" - this re-runs the effect
 
@@ -432,16 +441,20 @@ function App() {
     const map = mapRef.current.getMap();
     const lngLat = evt.lngLat;
 
-    // Check if clicked on confirmed events layer (for removal)
+    // Check if clicked on confirmed events layer (for edit/delete)
     if (editMode === 'events') {
       const eventFeatures = map.queryRenderedFeatures(evt.point, {
         layers: ['confirmed-events']
       });
       
       if (eventFeatures.length > 0) {
-        // Clicked on an existing event - remove it
+        // Clicked on an existing event - show edit dialog
         const event = eventFeatures[0].properties;
-        handleDeleteEvent(event.id);
+        // Find the full event object from confirmedEvents array
+        const fullEvent = confirmedEvents.find(e => e.id === event.id);
+        if (fullEvent) {
+          handleEditEvent(fullEvent);
+        }
         return;
       } else {
         // Clicked on empty space - add new event
@@ -496,7 +509,7 @@ function App() {
     }
   };
 
-  // Add confirmed event from map click
+  // Add confirmed event from map click - show dialog instead of confirm
   const handleAddEventFromMap = async (lat, lon) => {
     // Try to find municipality from nearby prediction points
     let municipio = 'Unknown';
@@ -526,42 +539,226 @@ function App() {
       }
     }
     
-    // Show confirmation dialog with event details
-    const confirmMessage = `Add Confirmed Event?\n\n` +
-      `Location: (${lat.toFixed(6)}, ${lon.toFixed(6)})\n` +
-      `Municipio: ${municipio}\n` +
-      `Source: Manual\n` +
-      `Description: Added from map click`;
+    // Set form with detected values and show dialog
+    setEventForm({
+      lat: lat.toFixed(6),
+      lon: lon.toFixed(6),
+      municipio: municipio,
+      description: '',
+      eventDate: ''
+    });
+    setShowEventDialog(true);
+  };
+
+  const handleSaveEvent = () => {
+    const lat = parseFloat(eventForm.lat);
+    const lon = parseFloat(eventForm.lon);
     
-    if (!window.confirm(confirmMessage)) {
-      return; // User cancelled
+    if (isNaN(lat) || isNaN(lon)) {
+      alert('Please enter valid coordinates');
+      return;
     }
     
-    fetch('http://localhost:5001/api/confirmed_events', {
-      method: 'POST',
+    if (!eventForm.municipio || eventForm.municipio.trim() === '') {
+      alert('Please enter a municipio');
+      return;
+    }
+    
+    const eventData = {
+      lat: lat,
+      lon: lon,
+      municipio: eventForm.municipio.trim(),
+      description: eventForm.description.trim() || (editingEvent ? '' : 'Added from map click')
+    };
+    
+    // Add event date if provided
+    if (eventForm.eventDate) {
+      eventData.event_date = eventForm.eventDate;
+    }
+    
+    // Only set source for new events (not when editing)
+    if (!editingEvent) {
+      eventData.source = 'manual';
+    }
+    
+    // If editing, use PUT; otherwise POST
+    const url = editingEvent 
+      ? `http://localhost:5001/api/confirmed_events/${editingEvent.id}`
+      : 'http://localhost:5001/api/confirmed_events';
+    const method = editingEvent ? 'PUT' : 'POST';
+    
+    fetch(url, {
+      method: method,
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        lat: lat,
-        lon: lon,
-        municipio: municipio,
-        source: 'manual',
-        description: 'Added from map click'
-      })
+      body: JSON.stringify(eventData)
     })
       .then(res => res.json())
       .then(data => {
         if (data.error) {
           alert(`Error: ${data.error}`);
         } else {
-          setConfirmedEvents([...confirmedEvents, data]);
-          alert('Confirmed event added successfully!');
+          if (editingEvent) {
+            // Update existing event in the list
+            setConfirmedEvents(confirmedEvents.map(e => e.id === editingEvent.id ? data : e));
+            alert('Confirmed event updated successfully!');
+          } else {
+            // Add new event
+            setConfirmedEvents([...confirmedEvents, data]);
+            alert('Confirmed event added successfully!');
+          }
+          setShowEventDialog(false);
+          setEditingEvent(null);
+          setEventForm({ lat: '', lon: '', municipio: '', description: '', eventDate: '' });
         }
       })
       .catch(err => {
-        console.error('Error adding event:', err);
-        alert('Error adding event. Please try again.');
+        console.error('Error saving event:', err);
+        alert('Error saving event. Please try again.');
+      });
+  };
+
+  const handleEditEvent = (event) => {
+    // Format event date for date input (YYYY-MM-DD)
+    let eventDateFormatted = '';
+    if (event.event_date) {
+      const date = new Date(event.event_date);
+      eventDateFormatted = date.toISOString().split('T')[0];
+    }
+    
+    setEventForm({
+      lat: event.lat?.toFixed(6) || '',
+      lon: event.lon?.toFixed(6) || '',
+      municipio: event.municipio || '',
+      description: event.description || '',
+      eventDate: eventDateFormatted
+    });
+    setEditingEvent(event);
+    setShowEventDialog(true);
+  };
+
+  // Handler for recalculate and predict
+  const handleRecalculateAndPredict = () => {
+    if (!window.confirm('This will recalculate distances based on confirmed events and update predictions using the existing model. This may take a few seconds. Continue?')) {
+      return;
+    }
+    
+    setIsRecalculating(true);
+    fetch('http://localhost:5001/api/recalculate_and_predict', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'TabCmpt',  // Default model
+        municipio: 'blockCV',  // Default municipio
+        subset: 'full',
+        objective: 'irm'
+      })
+    })
+      .then(res => res.json())
+      .then(data => {
+        setIsRecalculating(false);
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          alert(`Success! ${data.message}\nUpdated ${data.updated_count || 0} locations.${data.predictions_count ? `\nGenerated ${data.predictions_count} predictions.` : ''}`);
+          // Refresh map data to show updated predictions
+          const currentAreas = [...selectedAreas];
+          setSelectedAreas([]);
+          setTimeout(() => setSelectedAreas(currentAreas), 100);
+        }
+      })
+      .catch(err => {
+        setIsRecalculating(false);
+        console.error('Error recalculating:', err);
+        alert('Error recalculating predictions. Please try again.');
+      });
+  };
+
+  // Handler for retrain model (async job submission)
+  const handleRetrainModel = () => {
+    if (!window.confirm('This will retrain the model with updated labels and confirmed events. This may take 5-30 minutes. The job will run in the background. Continue?')) {
+      return;
+    }
+    
+    setIsRetraining(true);
+    
+    // Submit the training job
+    fetch('http://localhost:5001/api/retrain_model', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        municipio: 'blockCV',  // Default municipio
+        subset: 'full',
+        model: 'TabCmpt',
+        objective: 'irm',
+        n_step: 2
+      })
+    })
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        if (data.error) {
+          setIsRetraining(false);
+          alert(`Error: ${data.error}\n${data.message || ''}`);
+        } else {
+          // Job submitted successfully, start polling for status
+          const jobId = data.job_id;
+          const statusUrl = data.status_url || `/api/job_status/${jobId}`;
+          
+          alert(`Model training job submitted!\nJob ID: ${jobId}\n\nYou can check the status in the browser console. The page will refresh automatically when training completes.`);
+          
+          // Poll for job status
+          const pollInterval = setInterval(() => {
+            fetch(`http://localhost:5001${statusUrl}`)
+              .then(res => res.json())
+              .then(status => {
+                console.log('Training status:', status.status, status.progress || '');
+                
+                if (status.status === 'finished') {
+                  clearInterval(pollInterval);
+                  setIsRetraining(false);
+                  alert(`✅ Model training completed!\n\n${status.result?.message || 'Training finished successfully'}\n\nResults: ${status.result?.experiment_dir || 'experiments directory'}`);
+                  
+                  // Refresh map data to show updated predictions
+                  const currentAreas = [...selectedAreas];
+                  setSelectedAreas([]);
+                  setTimeout(() => setSelectedAreas(currentAreas), 100);
+                } else if (status.status === 'failed') {
+                  clearInterval(pollInterval);
+                  setIsRetraining(false);
+                  alert(`❌ Model training failed!\n\nError: ${status.error || status.result?.error || 'Unknown error'}`);
+                }
+                // If status is 'queued' or 'started', continue polling
+              })
+              .catch(err => {
+                console.error('Error checking job status:', err);
+                // Continue polling even if there's an error
+              });
+          }, 5000); // Poll every 5 seconds
+          
+          // Stop polling after 2 hours (safety timeout)
+          setTimeout(() => {
+            clearInterval(pollInterval);
+            if (isRetraining) {
+              setIsRetraining(false);
+              alert('⚠️ Job status polling timed out. The training may still be running. Check the backend logs or job status endpoint manually.');
+            }
+          }, 7200000); // 2 hours
+        }
+      })
+      .catch(err => {
+        setIsRetraining(false);
+        console.error('Error submitting training job:', err);
+        alert('Error submitting training job. Please make sure the backend is running and Redis is configured.');
       });
   };
 
@@ -907,17 +1104,6 @@ function App() {
         </div>
 
         <div className="control-group">
-          <strong>Municipality Borders</strong>
-          <input 
-            type="checkbox" 
-            id="show-municipality-borders" 
-            checked={showMunicipalityBorders}
-            onChange={e => setShowMunicipalityBorders(e.target.checked)}
-          />
-          <label htmlFor="show-municipality-borders">Show Municipality Borders</label>
-        </div>
-
-        <div className="control-group">
           <strong>Confirmed Events</strong>
           <input 
             type="checkbox" 
@@ -1033,11 +1219,66 @@ function App() {
               color: 'white',
               border: 'none',
               borderRadius: '4px',
-              cursor: 'pointer'
+              cursor: 'pointer',
+              marginBottom: '5px'
             }}
           >
             {showEventsPanel ? 'Hide' : 'Show'} Confirmed Events Panel ({confirmedEvents.length})
           </button>
+        </div>
+
+        <div className="control-group">
+          <strong>Update Predictions</strong>
+          <button 
+            onClick={handleRecalculateAndPredict}
+            disabled={isRecalculating}
+            style={{
+              width: '100%',
+              padding: '8px',
+              marginTop: '5px',
+              backgroundColor: isRecalculating ? '#6c757d' : '#007bff',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: isRecalculating ? 'not-allowed' : 'pointer',
+              opacity: isRecalculating ? 0.6 : 1
+            }}
+          >
+            {isRecalculating ? 'Recalculating...' : '🔄 Recalculate & Re-predict'}
+          </button>
+          <div style={{ 
+            fontSize: '11px', 
+            color: '#666', 
+            marginTop: '3px',
+            fontStyle: 'italic'
+          }}>
+            Updates distances and re-predicts with existing model
+          </div>
+          <button 
+            onClick={handleRetrainModel}
+            disabled={isRetraining}
+            style={{
+              width: '100%',
+              padding: '8px',
+              marginTop: '10px',
+              backgroundColor: isRetraining ? '#6c757d' : '#28a745',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: isRetraining ? 'not-allowed' : 'pointer',
+              opacity: isRetraining ? 0.6 : 1
+            }}
+          >
+            {isRetraining ? 'Retraining Model...' : '🎯 Retrain Model'}
+          </button>
+          <div style={{ 
+            fontSize: '11px', 
+            color: '#666', 
+            marginTop: '3px',
+            fontStyle: 'italic'
+          }}>
+            Retrains model with updated labels (takes several minutes)
+          </div>
         </div>
 
         {/* Historical Events section - commented out for now */}
@@ -1215,8 +1456,8 @@ function App() {
             </Source>
           )} */}
 
-          {/* 2.5. Municipality Borders Layer */}
-          {showMunicipalityBorders && municipalityBorders && (
+          {/* 2.5. Municipality Borders Layer - Render AFTER predictions so borders appear on top */}
+          {municipalityBorders && (
             <Source 
               key={`borders-${mapStyle}`}
               type="geojson" 
@@ -1226,17 +1467,17 @@ function App() {
                 id="municipality-borders-fill"
                 type="fill"
                 paint={{
-                  'fill-color': 'rgba(0, 123, 255, 0.1)', // Light blue fill
-                  'fill-opacity': 0.3
+                  'fill-color': 'rgba(0, 123, 255, 0.05)', // Very light blue fill
+                  'fill-opacity': 0.2
                 }}
               />
               <Layer
                 id="municipality-borders-outline"
                 type="line"
                 paint={{
-                  'line-color': '#007bff', // Blue outline
-                  'line-width': 2,
-                  'line-opacity': 0.8
+                  'line-color': '#0066cc', // Blue outline
+                  'line-width': 3,
+                  'line-opacity': 1.0
                 }}
               />
             </Source>
@@ -1525,6 +1766,175 @@ function App() {
           </div>
         )}
 
+        {/* Event Dialog */}
+        {showEventDialog && (
+          <div style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            background: 'white',
+            padding: '20px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: 2000,
+            minWidth: '350px',
+            maxWidth: '550px'
+          }}>
+            <h3 style={{ marginTop: 0 }}>{editingEvent ? 'Edit Confirmed Event' : 'Add Confirmed Event'}</h3>
+            
+            {/* Location Input */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', marginBottom: '5px' }}>
+                <strong>Location (Latitude, Longitude):</strong>
+              </label>
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <input
+                  type="number"
+                  step="any"
+                  placeholder="Latitude"
+                  value={eventForm.lat}
+                  onChange={(e) => setEventForm({ ...eventForm, lat: e.target.value })}
+                  style={{
+                    flex: 1,
+                    padding: '5px',
+                    border: '1px solid #ddd',
+                    borderRadius: '4px'
+                  }}
+                />
+                <span>,</span>
+                <input
+                  type="number"
+                  step="any"
+                  placeholder="Longitude"
+                  value={eventForm.lon}
+                  onChange={(e) => setEventForm({ ...eventForm, lon: e.target.value })}
+                  style={{
+                    flex: 1,
+                    padding: '5px',
+                    border: '1px solid #ddd',
+                    borderRadius: '4px'
+                  }}
+                />
+              </div>
+              <div style={{ fontSize: '12px', color: '#666', marginTop: '5px' }}>
+                Format: (10.576107, -75.427811)
+              </div>
+            </div>
+
+            {/* Municipio Input */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', marginBottom: '5px' }}>
+                <strong>Municipio:</strong>
+              </label>
+              <input
+                type="text"
+                value={eventForm.municipio}
+                onChange={(e) => setEventForm({ ...eventForm, municipio: e.target.value })}
+                style={{
+                  width: '100%',
+                  padding: '5px',
+                  border: '1px solid #ddd',
+                  borderRadius: '4px'
+                }}
+                placeholder="Enter municipio name"
+              />
+            </div>
+
+            {/* Event Date Input */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', marginBottom: '5px' }}>
+                <strong>Event Date (optional):</strong>
+              </label>
+              <input
+                type="date"
+                value={eventForm.eventDate}
+                onChange={(e) => setEventForm({ ...eventForm, eventDate: e.target.value })}
+                style={{
+                  width: '100%',
+                  padding: '5px',
+                  border: '1px solid #ddd',
+                  borderRadius: '4px'
+                }}
+              />
+            </div>
+
+            {/* Description/Notes Input */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', marginBottom: '5px' }}>
+                <strong>Description/Notes (optional):</strong>
+              </label>
+              <textarea
+                value={eventForm.description}
+                onChange={(e) => setEventForm({ ...eventForm, description: e.target.value })}
+                style={{
+                  width: '100%',
+                  minHeight: '60px',
+                  padding: '5px',
+                  border: '1px solid #ddd',
+                  borderRadius: '4px'
+                }}
+                placeholder="Add description or notes about this event..."
+              />
+            </div>
+
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => {
+                  setShowEventDialog(false);
+                  setEditingEvent(null);
+                  setEventForm({ lat: '', lon: '', municipio: '', description: '', eventDate: '' });
+                }}
+                style={{
+                  padding: '8px 16px',
+                  backgroundColor: '#6c757d',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer'
+                }}
+              >
+                Cancel
+              </button>
+              {editingEvent && (
+                <button
+                  onClick={() => {
+                    if (window.confirm('Are you sure you want to delete this confirmed event?')) {
+                      handleDeleteEvent(editingEvent.id);
+                      setShowEventDialog(false);
+                      setEditingEvent(null);
+                      setEventForm({ lat: '', lon: '', municipio: '', description: '', eventDate: '' });
+                    }
+                  }}
+                  style={{
+                    padding: '8px 16px',
+                    backgroundColor: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Delete
+                </button>
+              )}
+              <button
+                onClick={handleSaveEvent}
+                style={{
+                  padding: '8px 16px',
+                  backgroundColor: '#28a745',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer'
+                }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Confirmed Events Panel */}
         {showEventsPanel && (
           <div style={{
@@ -1574,20 +1984,36 @@ function App() {
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '5px' }}>
                       <strong>{event.municipio}</strong>
-                      <button
-                        onClick={() => handleDeleteEvent(event.id)}
-                        style={{
-                          background: '#dc3545',
-                          color: 'white',
-                          border: 'none',
-                          borderRadius: '3px',
-                          padding: '3px 8px',
-                          cursor: 'pointer',
-                          fontSize: '11px'
-                        }}
-                      >
-                        Delete
-                      </button>
+                      <div style={{ display: 'flex', gap: '5px' }}>
+                        <button
+                          onClick={() => handleEditEvent(event)}
+                          style={{
+                            background: '#007bff',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '3px 8px',
+                            cursor: 'pointer',
+                            fontSize: '11px'
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => handleDeleteEvent(event.id)}
+                          style={{
+                            background: '#dc3545',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '3px 8px',
+                            cursor: 'pointer',
+                            fontSize: '11px'
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </div>
                     <div style={{ fontSize: '12px', color: '#666' }}>
                       <div>Location: ({event.lat?.toFixed(4)}, {event.lon?.toFixed(4)})</div>
