@@ -1,6 +1,6 @@
-# Deployment Guide for RELand Backend
+# RELand Backend - Local Development Guide
 
-This guide explains how to deploy the RELand backend with background job processing for model training.
+This guide explains how to run the RELand backend locally with background job processing for model training.
 
 ## Architecture
 
@@ -18,12 +18,12 @@ Both services use Redis for job queuing.
 
 ## Environment Variables
 
-Required environment variables:
+Required environment variables (create a `.env` file in `reland-backend/`):
 
 ```bash
 DATABASE_URL=postgresql://user:password@host:port/database
 REDIS_URL=redis://localhost:6379/0
-FLASK_ENV=production
+FLASK_ENV=development
 ```
 
 ## Local Development Setup
@@ -55,6 +55,12 @@ sudo systemctl start redis
 docker run -d -p 6379:6379 redis:latest
 ```
 
+**Verify Redis is running:**
+```bash
+redis-cli ping
+# Should return: PONG
+```
+
 ### 3. Start the Backend
 
 **Terminal 1 - Web Server:**
@@ -72,87 +78,6 @@ python worker.py
 ```
 
 The backend will be available at `http://localhost:5001`
-
-## Deployment Options
-
-### Option 1: Railway (Recommended)
-
-Railway supports multiple services in one project.
-
-1. **Create Railway Project:**
-   - Go to [railway.app](https://railway.app)
-   - Create a new project
-   - Add PostgreSQL database
-   - Add Redis service
-
-2. **Deploy Web Service:**
-   - Connect your GitHub repo
-   - Set root directory to `reland-backend`
-   - Railway will auto-detect the `Procfile`
-   - Set environment variables:
-     - `DATABASE_URL` (from PostgreSQL service)
-     - `REDIS_URL` (from Redis service)
-     - `FLASK_ENV=production`
-
-3. **Deploy Worker Service:**
-   - In the same Railway project, add a new service
-   - Use the same repo and root directory
-   - Set the start command to: `python worker.py`
-   - Share the same environment variables
-
-4. **Configure Services:**
-   - Web service uses the `web` process from Procfile
-   - Worker service uses the `worker` process
-
-### Option 2: Render
-
-Render supports multiple services via `render.yaml`.
-
-1. **Create Render Account:**
-   - Go to [render.com](https://render.com)
-   - Connect your GitHub repo
-
-2. **Deploy Services:**
-   - Render will automatically detect `render.yaml`
-   - It will create:
-     - Web service (Flask API)
-     - Worker service (background jobs)
-   - Add PostgreSQL database
-   - Add Redis instance
-
-3. **Set Environment Variables:**
-   - `DATABASE_URL` (from PostgreSQL)
-   - `REDIS_URL` (from Redis)
-   - `FLASK_ENV=production`
-
-### Option 3: Heroku
-
-1. **Install Heroku CLI:**
-   ```bash
-   brew install heroku/brew/heroku  # macOS
-   ```
-
-2. **Create App:**
-   ```bash
-   heroku create reland-backend
-   heroku addons:create heroku-postgresql
-   heroku addons:create heroku-redis
-   ```
-
-3. **Set Environment Variables:**
-   ```bash
-   heroku config:set FLASK_ENV=production
-   ```
-
-4. **Deploy:**
-   ```bash
-   git push heroku main
-   ```
-
-5. **Scale Workers:**
-   ```bash
-   heroku ps:scale worker=1
-   ```
 
 ## API Endpoints
 
