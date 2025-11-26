@@ -122,13 +122,23 @@ def verify_rds_data(rds_url):
         return False
 
 if __name__ == '__main__':
-    # Get RDS URL from environment or prompt
-    rds_url = os.getenv('RDS_DATABASE_URL')
+    # Get RDS URL from command line argument, environment, or prompt
+    import argparse
+    parser = argparse.ArgumentParser(description='Migrate local database to RDS')
+    parser.add_argument('--rds-url', type=str, help='RDS database URL (postgresql://user:pass@host:port/db)')
+    parser.add_argument('--yes', action='store_true', help='Skip confirmation prompt')
+    args = parser.parse_args()
+    
+    rds_url = args.rds_url or os.getenv('RDS_DATABASE_URL')
     
     if not rds_url:
         print("Enter your RDS database URL:")
         print("Format: postgresql://username:password@host:port/database")
-        rds_url = input("RDS URL: ").strip()
+        try:
+            rds_url = input("RDS URL: ").strip()
+        except EOFError:
+            print("❌ RDS URL is required. Use --rds-url argument or set RDS_DATABASE_URL environment variable.")
+            sys.exit(1)
         
         if not rds_url:
             print("❌ RDS URL is required")
@@ -140,12 +150,17 @@ if __name__ == '__main__':
         sys.exit(1)
     
     # Confirm before importing
-    print("\n⚠️  This will overwrite any existing data in RDS!")
-    confirm = input("Continue? (yes/no): ").strip().lower()
-    
-    if confirm != 'yes':
-        print("Cancelled.")
-        sys.exit(0)
+    if not args.yes:
+        print("\n⚠️  This will overwrite any existing data in RDS!")
+        try:
+            confirm = input("Continue? (yes/no): ").strip().lower()
+        except EOFError:
+            print("❌ Interactive confirmation required. Use --yes to skip confirmation.")
+            sys.exit(1)
+        
+        if confirm != 'yes':
+            print("Cancelled.")
+            sys.exit(0)
     
     # Import to RDS
     if import_to_rds(backup_file, rds_url):

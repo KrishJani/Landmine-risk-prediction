@@ -6,16 +6,34 @@ from datetime import datetime
 from math import isfinite
 from dotenv import load_dotenv
 from models import db, Location, UserLabel, ConfirmedEvent
-from municipality_borders import get_municipality_borders, get_all_municipality_names
+
+# Optional municipality borders import (may fail if shapefile missing)
+try:
+    from municipality_borders import get_municipality_borders, get_all_municipality_names
+    MUNICIPALITY_BORDERS_AVAILABLE = True
+except (ImportError, FileNotFoundError) as e:
+    print(f"⚠️  Warning: municipality_borders not available ({str(e)}). Municipality endpoints will not work.", file=sys.stdout, flush=True)
+    MUNICIPALITY_BORDERS_AVAILABLE = False
+    get_municipality_borders = None
+    get_all_municipality_names = None
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import subprocess
 import glob
 import sys
-from rq import Queue
-from rq.job import Job
-from redis import Redis
+
+# Optional Redis/RQ imports for background jobs
+try:
+    from rq import Queue
+    from rq.job import Job
+    from redis import Redis
+    RQ_AVAILABLE = True
+except ImportError:
+    RQ_AVAILABLE = False
+    Queue = None
+    Job = None
+    Redis = None
 
 # Optional imports for model prediction (only needed when recalculating predictions)
 try:
@@ -25,13 +43,25 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 # Load environment variables from .env file
-load_dotenv()
+# override=False ensures environment variables take precedence
+# Only load .env if DATABASE_URL is not already set (for local development)
+if not os.getenv('DATABASE_URL'):
+    load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 # Database configuration - PostgreSQL
+# Environment variables (from EB) take precedence over .env file
 DATABASE_URL = os.getenv('DATABASE_URL')
+# Force print to stdout so it shows in logs
+import sys
+if DATABASE_URL:
+    print(f"✓ Using DATABASE_URL from environment: {DATABASE_URL[:50]}...", file=sys.stdout, flush=True)
+    print(f"✓ Full DATABASE_URL: {DATABASE_URL}", file=sys.stdout, flush=True)
+else:
+    print("⚠️  DATABASE_URL not found in environment", file=sys.stdout, flush=True)
+    print(f"⚠️  Available env vars with 'DATABASE': {[k for k in os.environ.keys() if 'DATABASE' in k]}", file=sys.stdout, flush=True)
 if not DATABASE_URL:
     raise ValueError(
         "DATABASE_URL environment variable is not set. "
@@ -43,24 +73,34 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,  # Verify connections before using
     'pool_recycle': 300,    # Recycle connections after 5 minutes
+    'pool_timeout': 10,     # 10 second timeout for getting connection from pool
+    'connect_args': {
+        'connect_timeout': 10  # 10 second connection timeout
+    }
 }
 
 # Initialize database
 db.init_app(app)
+# Note: Database connection will be tested on first request
 
 # Redis Queue configuration for background jobs
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-try:
-    redis_conn = Redis.from_url(REDIS_URL)
-    # Test connection
-    redis_conn.ping()
-    task_queue = Queue('model_training', connection=redis_conn)
-    print("✓ Redis connection established for background jobs")
-except Exception as e:
-    print(f"⚠️  Warning: Redis not available ({str(e)}). Background jobs will not work.")
-    print("   Set REDIS_URL environment variable to enable background model training.")
-    redis_conn = None
-    task_queue = None
+redis_conn = None
+task_queue = None
+if RQ_AVAILABLE:
+    try:
+        redis_conn = Redis.from_url(REDIS_URL)
+        # Test connection
+        redis_conn.ping()
+        task_queue = Queue('model_training', connection=redis_conn)
+        print("✓ Redis connection established for background jobs", file=sys.stdout, flush=True)
+    except Exception as e:
+        print(f"⚠️  Warning: Redis not available ({str(e)}). Background jobs will not work.", file=sys.stdout, flush=True)
+        print("   Set REDIS_URL environment variable to enable background model training.", file=sys.stdout, flush=True)
+        redis_conn = None
+        task_queue = None
+else:
+    print("⚠️  Warning: rq/redis packages not installed. Background jobs will not work.", file=sys.stdout, flush=True)
 
 # Helper Functions
 def calculate_risk_levels(locations, score_column='risk_score'):
@@ -115,31 +155,49 @@ def get_color_for_risk_level(risk_level):
 @app.route('/')
 def index():
     """Root endpoint - API information"""
-    return jsonify({
-        "message": "RELand Backend API",
-        "version": "2.0",
-        "mode": "database-only",
-        "endpoints": {
-            "/api/initial_data": "GET - Get list of available areas",
-            "/api/map_data": "GET - Get map data for selected areas",
-            "/api/municipality_borders": "GET - Get municipality borders as GeoJSON",
-            "/api/geocode": "GET - Geocode an address",
-            "/api/labels": "GET/POST - Manage user labels",
-            "/api/confirmed_events": "GET/POST/PUT/DELETE - Manage confirmed events",
-            "/api/locations": "PUT/POST - Update location risk scores"
-        }
-    })
+    # This endpoint doesn't use database, should respond immediately
+    print("Root endpoint called", file=sys.stdout, flush=True)
+    try:
+        response = jsonify({
+            "message": "RELand Backend API",
+            "version": "2.0",
+            "mode": "database-only",
+            "endpoints": {
+                "/api/initial_data": "GET - Get list of available areas",
+                "/api/map_data": "GET - Get map data for selected areas",
+                "/api/municipality_borders": "GET - Get municipality borders as GeoJSON",
+                "/api/geocode": "GET - Geocode an address",
+                "/api/labels": "GET/POST - Manage user labels",
+                "/api/confirmed_events": "GET/POST/PUT/DELETE - Manage confirmed events",
+                "/api/locations": "PUT/POST - Update location risk scores"
+            }
+        })
+        print("Root endpoint response prepared", file=sys.stdout, flush=True)
+        return response
+    except Exception as e:
+        print(f"Error in root endpoint: {str(e)}", file=sys.stdout, flush=True)
+        import traceback
+        print(traceback.format_exc(), file=sys.stdout, flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/health')
+def health():
+    """Simple health check endpoint - no database, no imports"""
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/api/initial_data')
 def get_initial_data():
     """Get list of available areas from database"""
     try:
-        areas = db.session.query(Location.municipio).distinct().all()
-        area_list = [area[0] for area in areas if area[0] and area[0].lower() != 'unknown']
-        area_list.sort()
+        # Use raw SQL for faster query
+        result = db.session.execute(db.text("SELECT DISTINCT municipio FROM locations WHERE municipio IS NOT NULL AND municipio != 'Unknown' ORDER BY municipio"))
+        area_list = [row[0] for row in result if row[0]]
         return jsonify({"areas": area_list})
-    except Exception:
-        return jsonify({"areas": []})
+    except Exception as e:
+        print(f"Error in /api/initial_data: {str(e)}", file=sys.stdout, flush=True)
+        import traceback
+        print(traceback.format_exc(), file=sys.stdout, flush=True)
+        return jsonify({"areas": [], "error": str(e)}), 500
 
 @app.route('/api/map_data')
 def get_map_data():
@@ -283,6 +341,9 @@ def get_map_data():
 @app.route('/api/municipality_borders')
 def get_municipality_borders_endpoint():
     """Get municipality borders as GeoJSON"""
+    if not MUNICIPALITY_BORDERS_AVAILABLE:
+        return jsonify({"error": "Municipality borders feature not available"}), 503
+    
     try:
         # Get municipality names from query parameters
         municipality_names = request.args.getlist('municipalities[]')
@@ -1005,12 +1066,6 @@ def retrain_model():
     Use /api/job_status/<job_id> to check progress.
     """
     try:
-        if not task_queue:
-            return jsonify({
-                "error": "Background job queue not available",
-                "message": "Redis is not configured. Set REDIS_URL environment variable."
-            }), 503
-        
         data = request.json or {}
         municipio = data.get('municipio', 'blockCV')
         subset = data.get('subset', 'full')
@@ -1018,34 +1073,43 @@ def retrain_model():
         objective = data.get('objective', 'irm')
         n_step = data.get('n_step', 2)
         
-        print(f"🔄 Submitting model training job...")
+        # If Redis is available, submit as background job
+        if RQ_AVAILABLE and task_queue:
+            print(f"🔄 Submitting model training job...")
+            print(f"  Municipio: {municipio}")
+            print(f"  Subset: {subset}")
+            print(f"  Model: {model_name}")
+            print(f"  Objective: {objective}")
+            
+            # Import task function
+            from tasks import train_model_task
+            
+            # Submit job to queue
+            job = task_queue.enqueue(
+                train_model_task,
+                municipio=municipio,
+                subset=subset,
+                model_name=model_name,
+                objective=objective,
+                n_step=n_step,
+                db_url=DATABASE_URL,
+                job_timeout=3600,  # 1 hour timeout
+                result_ttl=86400   # Keep results for 24 hours
+            )
+            
+            return jsonify({
+                "message": "Model training job submitted successfully",
+                "job_id": job.id,
+                "status": "queued",
+                "status_url": f"/api/job_status/{job.id}"
+            }), 202
+        
+        # Fallback: Run synchronously if Redis is not available
+        print(f"🔄 Running model training synchronously (Redis not available)...")
         print(f"  Municipio: {municipio}")
         print(f"  Subset: {subset}")
         print(f"  Model: {model_name}")
         print(f"  Objective: {objective}")
-        
-        # Import task function
-        from tasks import train_model_task
-        
-        # Submit job to queue
-        job = task_queue.enqueue(
-            train_model_task,
-            municipio=municipio,
-            subset=subset,
-            model_name=model_name,
-            objective=objective,
-            n_step=n_step,
-            db_url=DATABASE_URL,
-            job_timeout=3600,  # 1 hour timeout
-            result_ttl=86400   # Keep results for 24 hours
-        )
-        
-        return jsonify({
-            "message": "Model training job submitted successfully",
-            "job_id": job.id,
-            "status": "queued",
-            "status_url": f"/api/job_status/{job.id}"
-        }), 202
         
         # First, recalculate distances if confirmed events exist
         confirmed_events = ConfirmedEvent.query.all()
@@ -1393,7 +1457,7 @@ def get_job_status(job_id):
     Returns: queued, started, finished, failed, or not_found
     """
     try:
-        if not redis_conn:
+        if not RQ_AVAILABLE or not redis_conn:
             return jsonify({
                 "error": "Redis not available",
                 "message": "Cannot check job status without Redis"
@@ -1442,7 +1506,7 @@ def list_jobs():
     List recent jobs in the queue.
     """
     try:
-        if not task_queue:
+        if not RQ_AVAILABLE or not task_queue:
             return jsonify({
                 "error": "Background job queue not available"
             }), 503
@@ -1466,6 +1530,8 @@ def list_jobs():
         # Add started jobs
         for job_id in started_jobs[:10]:
             try:
+                if not RQ_AVAILABLE:
+                    break
                 job = Job.fetch(job_id, connection=redis_conn)
                 jobs.append({
                     "job_id": job.id,
@@ -1480,6 +1546,8 @@ def list_jobs():
         # Add finished jobs
         for job_id in finished_jobs[:10]:
             try:
+                if not RQ_AVAILABLE:
+                    break
                 job = Job.fetch(job_id, connection=redis_conn)
                 jobs.append({
                     "job_id": job.id,
@@ -1493,6 +1561,8 @@ def list_jobs():
         # Add failed jobs
         for job_id in failed_jobs[:10]:
             try:
+                if not RQ_AVAILABLE:
+                    break
                 job = Job.fetch(job_id, connection=redis_conn)
                 jobs.append({
                     "job_id": job.id,
