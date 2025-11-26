@@ -10,6 +10,10 @@ import './App.css'; // We will create this file for styling
 // const MAPBOX_TOKEN = process.env.REACT_APP_MAPBOX_TOKEN || 'pk.eyJ1IjoicWl3YW5nYWFhIiwiYSI6ImNremtyNmxkNzR5aGwyb25mOWxocmxvOGoifQ.7ELp2wgswTdQZS_RsnW1PA';
 const MAPBOX_TOKEN = 'pk.eyJ1Ijoia3JyaXNoMjUiLCJhIjoiY21oamRmbnptMWNhdjJrcHFqaXoybWo0cSJ9.-fbOe_Xt-AJvinYHStN0ew';
 
+// --- API Configuration ---
+// Get API URL from environment variable or use localhost for development
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+
 
 // This is the default center from your Dash app
 const initialViewport = {
@@ -146,7 +150,7 @@ function App() {
   // 1. Fetch the list of areas for the dropdown ONCE when the app loads
   useEffect(() => {
     // This 'useEffect' with an empty array [] runs only once.
-    fetch('http://localhost:5001/api/initial_data')
+    fetch(`${API_BASE_URL}/api/initial_data`)
       .then(res => {
         if (!res.ok) {
           throw new Error(`HTTP error! status: ${res.status}`);
@@ -160,7 +164,7 @@ function App() {
       })
       .catch(err => {
         console.error("Error fetching initial data:", err);
-        alert("Error connecting to backend. Make sure the backend server is running on http://localhost:5001");
+        alert(`Error connecting to backend. Make sure the backend server is running on ${API_BASE_URL}`);
       });
   }, []);
 
@@ -182,7 +186,7 @@ function App() {
     selectedAreas.forEach(area => params.append('areas[]', area));
     
     // Fetch data from our Python backend!
-    fetch(`http://localhost:5001/api/map_data?${params.toString()}`)
+    fetch(`${API_BASE_URL}/api/map_data?${params.toString()}`)
       .then(res => {
         if (!res.ok) {
           throw new Error(`HTTP error! status: ${res.status}`);
@@ -335,8 +339,8 @@ function App() {
     // If no areas selected or no valid areas, fetch all borders (no params = all borders)
     
     const borderUrl = borderParams.toString() 
-      ? `http://localhost:5001/api/municipality_borders?${borderParams.toString()}`
-      : 'http://localhost:5001/api/municipality_borders';
+      ? `${API_BASE_URL}/api/municipality_borders?${borderParams.toString()}`
+      : `${API_BASE_URL}/api/municipality_borders`;
     
     fetch(borderUrl)
       .then(res => {
@@ -402,7 +406,7 @@ function App() {
     }
     
     // Call our NEW backend geocoding endpoint
-    fetch(`http://localhost:5001/api/geocode?address=${encodeURIComponent(searchText)}`)
+    fetch(`${API_BASE_URL}/api/geocode?address=${encodeURIComponent(searchText)}`)
       .then(res => {
         if (!res.ok) {
           return res.json().then(data => {
@@ -583,8 +587,8 @@ function App() {
     
     // If editing, use PUT; otherwise POST
     const url = editingEvent 
-      ? `http://localhost:5001/api/confirmed_events/${editingEvent.id}`
-      : 'http://localhost:5001/api/confirmed_events';
+      ? `${API_BASE_URL}/api/confirmed_events/${editingEvent.id}`
+      : `${API_BASE_URL}/api/confirmed_events`;
     const method = editingEvent ? 'PUT' : 'POST';
     
     fetch(url, {
@@ -645,7 +649,7 @@ function App() {
     }
     
     setIsRecalculating(true);
-    fetch('http://localhost:5001/api/recalculate_and_predict', {
+    fetch(`${API_BASE_URL}/api/recalculate_and_predict`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -686,7 +690,7 @@ function App() {
     setIsRetraining(true);
     
     // Submit the training job
-    fetch('http://localhost:5001/api/retrain_model', {
+    fetch(`${API_BASE_URL}/api/retrain_model`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -718,7 +722,7 @@ function App() {
           
           // Poll for job status
           const pollInterval = setInterval(() => {
-            fetch(`http://localhost:5001${statusUrl}`)
+            fetch(`${API_BASE_URL}${statusUrl}`)
               .then(res => res.json())
               .then(status => {
                 console.log('Training status:', status.status, status.progress || '');
@@ -791,7 +795,7 @@ function App() {
       location_id = selectedPoint.location_id;
     }
 
-    fetch('http://localhost:5001/api/labels', {
+    fetch(`${API_BASE_URL}/api/labels`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -841,7 +845,7 @@ function App() {
       return;
     }
 
-    fetch(`http://localhost:5001/api/labels/${selectedPoint.location_id}`, {
+    fetch(`${API_BASE_URL}/api/labels/${selectedPoint.location_id}`, {
       method: 'DELETE'
     })
       .then(res => res.json())
@@ -864,7 +868,7 @@ function App() {
 
   // Confirmed events handlers
   const fetchConfirmedEvents = () => {
-    fetch('http://localhost:5001/api/confirmed_events')
+    fetch(`${API_BASE_URL}/api/confirmed_events`)
       .then(res => res.json())
       .then(data => {
         if (data.confirmed_events) {
@@ -882,7 +886,7 @@ function App() {
       return;
     }
 
-    fetch(`http://localhost:5001/api/confirmed_events/${eventId}`, {
+    fetch(`${API_BASE_URL}/api/confirmed_events/${eventId}`, {
       method: 'DELETE'
     })
       .then(res => res.json())
@@ -902,7 +906,7 @@ function App() {
 
   // Load labels and events on mount
   useEffect(() => {
-    fetch('http://localhost:5001/api/labels')
+    fetch(`${API_BASE_URL}/api/labels`)
       .then(res => res.json())
       .then(data => {
         if (data.labels) {

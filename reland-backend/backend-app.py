@@ -1586,4 +1586,6 @@ if __name__ == '__main__':
         print(f"🌐 Running on: http://localhost:5001")
         print("="*50 + "\n")
     
-    app.run(debug=True, port=5001, host='127.0.0.1')
+    # Use environment variable for port (EB sets PORT automatically)
+    port = int(os.environ.get('PORT', 5001))
+    app.run(host='0.0.0.0', port=port, debug=False)
