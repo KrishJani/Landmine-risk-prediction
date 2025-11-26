@@ -694,23 +694,40 @@ function App() {
       body: JSON.stringify({
         municipio: 'blockCV',  // Default municipio
         subset: 'full',
-        model: 'TabCmpt',
+        model: 'MLP_IRM',  // Using simple lightweight model for testing
         objective: 'irm',
         n_step: 2
       })
     })
       .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP error! status: ${res.status}`);
-        }
-        return res.json();
+        // Parse JSON even for error responses
+        return res.json().then(data => {
+          // If status is not OK, include status in the data
+          if (!res.ok) {
+            data.httpStatus = res.status;
+            data.httpError = true;
+          }
+          return data;
+        });
       })
       .then(data => {
-        if (data.error) {
+        // Handle HTTP errors or backend errors
+        if (data.httpError || data.error) {
           setIsRetraining(false);
-          alert(`Error: ${data.error}\n${data.message || ''}`);
+          const errorMsg = data.error || 'Unknown error';
+          const details = data.details ? `\n\nDetails: ${data.details.substring(0, 500)}` : '';
+          alert(`Error: ${errorMsg}${details}\n\nStatus: ${data.mode || 'unknown mode'}`);
+        } else if (data.mode === 'synchronous' || !data.job_id) {
+          // Synchronous mode - training completed immediately
+          setIsRetraining(false);
+          alert(`✅ Model training completed!\n\n${data.message || 'Training finished successfully'}\n\nTimestamp: ${data.timestamp || 'N/A'}\nExperiment Dir: ${data.experiment_dir || 'N/A'}`);
+          
+          // Refresh map data to show updated predictions
+          const currentAreas = [...selectedAreas];
+          setSelectedAreas([]);
+          setTimeout(() => setSelectedAreas(currentAreas), 100);
         } else {
-          // Job submitted successfully, start polling for status
+          // Background mode - job submitted, start polling
           const jobId = data.job_id;
           const statusUrl = data.status_url || `/api/job_status/${jobId}`;
           
@@ -758,7 +775,7 @@ function App() {
       .catch(err => {
         setIsRetraining(false);
         console.error('Error submitting training job:', err);
-        alert('Error submitting training job. Please make sure the backend is running and Redis is configured.');
+        alert(`Error submitting training job: ${err.message}\n\nPlease check:\n1. Backend is running on http://localhost:5001\n2. Backend logs for detailed error messages\n3. Browser console for network errors`);
       });
   };
 

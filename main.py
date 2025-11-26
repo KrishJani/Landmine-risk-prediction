@@ -8,8 +8,16 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from model import PushedLR
 import lightgbm as lgb
-import pytorch_tabnet.tab_model as erm_tab_model
-import pytorch_tabnet_irm.tab_model as irm_tab_model
+
+# Optional imports for TabNet (only needed if using TabNet model)
+try:
+    import pytorch_tabnet.tab_model as erm_tab_model
+    import pytorch_tabnet_irm.tab_model as irm_tab_model
+    TABNET_AVAILABLE = True
+except ImportError:
+    TABNET_AVAILABLE = False
+    erm_tab_model = None
+    irm_tab_model = None
 
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 
@@ -17,6 +25,15 @@ from dataset import Event
 from reland import RELand
 from loss import RankLoss
 from utils import mean_reverse_height, mean_height, sigmoid
+
+# Import simple MLP_IRM model for testing
+try:
+    from mlp_irm import MLP_IRM, Event as SimpleEvent
+    MLP_IRM_AVAILABLE = True
+except ImportError:
+    MLP_IRM_AVAILABLE = False
+    MLP_IRM = None
+    SimpleEvent = None
 
 import os
 import json
@@ -26,7 +43,13 @@ import argparse
 import pickle
 from typing import *
 
-import matplotlib.pyplot as plt
+# Optional import for plotting (only needed for visualization)
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
 
 def main(timestamp : str, train_val_stream : List):
     # TODO: ood bench
@@ -125,12 +148,41 @@ def main(timestamp : str, train_val_stream : List):
             elif model_name == 'SVM':
                 params = {'C':0.00001,'probability':True}
                 model = SVC(**params)
+            elif model_name == 'MLP_IRM':
+                # Simple lightweight MLP_IRM model for testing
+                if not MLP_IRM_AVAILABLE:
+                    raise ImportError("MLP_IRM model not available. Make sure mlp_irm.py exists.")
+                # Prepare data for MLP_IRM (needs close_hist_mine)
+                # Find dist_old_mine column index
+                dist_col_idx = None
+                if 'dist_old_mine' in val_data.features:
+                    dist_col_idx = val_data.features.index('dist_old_mine')
+                    close_hist_mine_train = 1*(X_train[:, dist_col_idx] < 0.5)
+                    close_hist_mine_val = 1*(X_val[:, dist_col_idx] < 0.5)
+                else:
+                    close_hist_mine_train = np.zeros(len(X_train))
+                    close_hist_mine_val = np.zeros(len(X_val))
+                
+                # Convert to pandas for SimpleEvent
+                X_train_df = pd.DataFrame(X_train, columns=val_data.features)
+                X_val_df = pd.DataFrame(X_val, columns=val_data.features)
+                y_train_series = pd.Series(y_train)
+                y_val_series = pd.Series(y_val)
+                
+                train_event = SimpleEvent(X_train_df, y_train_series, pd.Series(close_hist_mine_train))
+                val_event = SimpleEvent(X_val_df, y_val_series, pd.Series(close_hist_mine_val))
+                
+                model = MLP_IRM(num_features=X_train.shape[1], epochs=epochs, batch_size=batch_size)
             elif model_name == 'TabNet' and objective == 'erm':
+                if not TABNET_AVAILABLE:
+                    raise ImportError("pytorch_tabnet is not installed. Install it with: pip install pytorch-tabnet")
                 params = {'seed':737, 'n_steps':n_step}
                 if args.municipio == 'transfer':
                     params['optimizer_params'] = {'lr':1e-2} # default lr = 2e-2
                 model = erm_tab_model.TabNetClassifier(**params)
             elif model_name == 'TabNet' and objective == 'irm':
+                if not TABNET_AVAILABLE:
+                    raise ImportError("pytorch_tabnet_irm is not installed. Install it with: pip install pytorch-tabnet-irm")
                 params = {'seed':737, 'n_steps':n_step}
                 model = irm_tab_model.TabNetClassifier(**params)
 
@@ -139,6 +191,42 @@ def main(timestamp : str, train_val_stream : List):
                 ckpt = model.fit(train_data, val_data) # get validation result
                 if args.municipio == 'puerto' or args.municipio == 'murindo':
                     _, _, _, _, test_pred, _ = model.predict_proba(test_dataset = test_data)
+            elif model_name == 'MLP_IRM':
+                # Train MLP_IRM model
+                model.fit(train_event, val_event)
+                # Get predictions
+                val_pred = model.predict_proba(val_event)
+                if args.municipio == 'puerto' or args.municipio == 'murindo':
+                    X_test_df = pd.DataFrame(X_test, columns=val_data.features)
+                    # Find dist_old_mine column index for test data
+                    test_dist_col_idx = None
+                    if 'dist_old_mine' in val_data.features:
+                        test_dist_col_idx = val_data.features.index('dist_old_mine')
+                        close_hist_mine_test = 1*(X_test[:, test_dist_col_idx] < 0.5)
+                    else:
+                        close_hist_mine_test = np.zeros(len(X_test))
+                    test_event = SimpleEvent(X_test_df, pd.Series(np.zeros(len(X_test))), pd.Series(close_hist_mine_test))
+                    test_pred = model.predict_proba(test_event)
+                
+                # Calculate metrics
+                roc = roc_auc_score(y_val, val_pred)
+                precision, recall, _ = precision_recall_curve(y_val, val_pred)
+                pr = auc(recall, precision)
+                height = mean_height(y_val, val_pred)
+                rheight = mean_reverse_height(y_val, val_pred)
+                
+                ckpt = dict()
+                ckpt['roc'] = roc
+                ckpt['pr'] = pr
+                ckpt['height'] = height
+                ckpt['rheight'] = rheight
+                ckpt['prob'] = val_pred
+                ckpt['importance'] = []  # MLP_IRM doesn't provide feature importance
+                
+                # Save model
+                import torch
+                os.makedirs(f'./experiments/{timestamp}', exist_ok=True)
+                torch.save(model.model.state_dict(), f'./experiments/{timestamp}/{mpio}.pth')
             elif model_name == 'LGBM' and objective == 'pnorm':
                 model.fit(X_train,y_train,eval_set=[(X_val, y_val)],early_stopping_rounds=epochs,eval_metric="auc")
                 val_pred = sigmoid(model.predict(np.array(X_val), raw_score=True))
@@ -222,25 +310,29 @@ def main(timestamp : str, train_val_stream : List):
             predicted_proba_df = pd.concat(predicted_proba, axis=0)
             predicted_proba_df.to_csv(f'./experiments/{timestamp}/predicted_proba.csv',index=False)
 
-            _, axes = plt.subplots(nrows=1, ncols=2, figsize=(14,6))
-            mappable = axes[0].scatter(lat_lon[:,0], lat_lon[:,1], c=val_prob)
-            axes[0].set_title(f'{mpio}\n'
-                            f'roc-{roc:.3f}-pr-{pr:.3f}\n'
-                            f'height-{height:.3f}-rheight-{rheight:.3f}')
+            # Plot visualization if matplotlib is available
+            if MATPLOTLIB_AVAILABLE:
+                _, axes = plt.subplots(nrows=1, ncols=2, figsize=(14,6))
+                mappable = axes[0].scatter(lat_lon[:,0], lat_lon[:,1], c=val_prob)
+                axes[0].set_title(f'{mpio}\n'
+                                f'roc-{roc:.3f}-pr-{pr:.3f}\n'
+                                f'height-{height:.3f}-rheight-{rheight:.3f}')
 
-            y_truth = np.array([int(y) for y in val_data.y])
-            colors = ['yellow','navy']
-            pos_idx = y_truth == 1
-            neg_idx = y_truth == 0
-            neg = axes[1].scatter(lat_lon[:,0][neg_idx], lat_lon[:,1][neg_idx], c=colors[1])
-            pos = axes[1].scatter(lat_lon[:,0][pos_idx], lat_lon[:,1][pos_idx], c=colors[0])
-            axes[1].set_title('truth')
-            axes[1].legend((pos, neg),('pos','neg'))
-            
-            plt.tight_layout()
-            plt.colorbar(mappable,ax=axes[0])
-            plt.savefig(f'./experiments/{timestamp}/{mpio}.png')
-            plt.clf()
+                y_truth = np.array([int(y) for y in val_data.y])
+                colors = ['yellow','navy']
+                pos_idx = y_truth == 1
+                neg_idx = y_truth == 0
+                neg = axes[1].scatter(lat_lon[:,0][neg_idx], lat_lon[:,1][neg_idx], c=colors[1])
+                pos = axes[1].scatter(lat_lon[:,0][pos_idx], lat_lon[:,1][pos_idx], c=colors[0])
+                axes[1].set_title('truth')
+                axes[1].legend((pos, neg),('pos','neg'))
+                
+                plt.tight_layout()
+                plt.colorbar(mappable,ax=axes[0])
+                plt.savefig(f'./experiments/{timestamp}/{mpio}.png')
+                plt.clf()
+            else:
+                print(f"  Note: matplotlib not available, skipping visualization for {mpio}")
 
         res['mean/std_roc'] = [np.mean(res['roc']), np.std(res['roc'])]
         res['mean/std_pr'] = [np.mean(res['pr']), np.std(res['pr'])]
@@ -273,15 +365,19 @@ def main(timestamp : str, train_val_stream : List):
                                     'LATITUD_Y':lat_lon_test[:,1],
                                     'predicted_proba':test_pred}))
             test_df.to_csv(f'./experiments/{timestamp}/test_results.csv',index=False)
-            _, axes = plt.subplots(nrows=1, ncols=1, figsize=(5,5))
-            mappable = plt.scatter(lat_lon_test[:,0], lat_lon_test[:,1], c=test_pred)
-            if args.municipio == 'puerto':
-                axes.set_title('PUERTO LIBERTADOR')
-            elif args.municipio == 'murindo':
-                axes.set_title('MURINDÓ')
-            plt.colorbar(mappable)
-            plt.savefig(f'./experiments/{timestamp}/test_results.png')
-            plt.clf()
+            # Plot test results if matplotlib is available
+            if MATPLOTLIB_AVAILABLE:
+                _, axes = plt.subplots(nrows=1, ncols=1, figsize=(5,5))
+                mappable = plt.scatter(lat_lon_test[:,0], lat_lon_test[:,1], c=test_pred)
+                if args.municipio == 'puerto':
+                    axes.set_title('PUERTO LIBERTADOR')
+                elif args.municipio == 'murindo':
+                    axes.set_title('MURINDÓ')
+                plt.colorbar(mappable)
+                plt.savefig(f'./experiments/{timestamp}/test_results.png')
+                plt.clf()
+            else:
+                print(f"  Note: matplotlib not available, skipping test visualization")
 
 
     return res
@@ -294,7 +390,7 @@ if __name__ == "__main__":
     parser.add_argument("--timestamp", help=r'unique experiment id, hint: datetime.now().strftime("%%m%%d%%Y%%H%%M%%S")') 
     parser.add_argument("--municipio", required=True, help='directory with train test split info')
     parser.add_argument("--subset", required=True, help='single | geo | full')
-    parser.add_argument("--model", required=True, help='TabCmpt | MLP | TabNet | LR | RF | SVM | LGBM')
+    parser.add_argument("--model", required=True, help='TabCmpt | MLP | MLP_IRM | TabNet | LR | RF | SVM | LGBM')
     parser.add_argument("--objective", required=True, help='irm | erm | pnorm')
     parser.add_argument("--n_step", type=int, help='number of decision blocks')
     parser.add_argument("--warm_start", help='directory for checkpoints for warm start')
@@ -342,6 +438,10 @@ if __name__ == "__main__":
     args.lambda_l2 = lambda_l2
     args.device = device
 
+    # Create experiments directory first
+    os.makedirs(f"./experiments/{timestamp}", exist_ok=True)
+    os.makedirs(f"./experiments/{timestamp}/code", exist_ok=True)
+    
     config = vars(args)
     with open(f"./experiments/{args.timestamp}/config.json", 'w') as outfile:
         if config['device'].type == 'cuda':
@@ -352,7 +452,6 @@ if __name__ == "__main__":
     
     print(f"Exp {timestamp} continued.")
     # current code backup
-    os.makedirs(f"./experiments/{timestamp}/code", exist_ok=True)
     python_files = glob.glob('./**.py',recursive=False)
     for py in python_files:
         fname = py.split('/')[-1]

@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -13,9 +14,18 @@ from sklearn.neighbors import NearestNeighbors
 import subprocess
 import glob
 import sys
-from rq import Queue
-from rq.job import Job
-from redis import Redis
+
+# Optional imports for Redis Queue (background jobs)
+try:
+    from rq import Queue
+    from rq.job import Job
+    from redis import Redis
+    RQ_AVAILABLE = True
+except ImportError:
+    RQ_AVAILABLE = False
+    Queue = None
+    Job = None
+    Redis = None
 
 # Optional imports for model prediction (only needed when recalculating predictions)
 try:
@@ -50,17 +60,24 @@ db.init_app(app)
 
 # Redis Queue configuration for background jobs
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-try:
-    redis_conn = Redis.from_url(REDIS_URL)
-    # Test connection
-    redis_conn.ping()
-    task_queue = Queue('model_training', connection=redis_conn)
-    print("✓ Redis connection established for background jobs")
-except Exception as e:
-    print(f"⚠️  Warning: Redis not available ({str(e)}). Background jobs will not work.")
-    print("   Set REDIS_URL environment variable to enable background model training.")
-    redis_conn = None
-    task_queue = None
+redis_conn = None
+task_queue = None
+
+if RQ_AVAILABLE:
+    try:
+        redis_conn = Redis.from_url(REDIS_URL)
+        # Test connection
+        redis_conn.ping()
+        task_queue = Queue('model_training', connection=redis_conn)
+        print("✓ Redis connection established for background jobs")
+    except Exception as e:
+        print(f"⚠️  Warning: Redis not available ({str(e)}). Background jobs will not work.")
+        print("   Set REDIS_URL environment variable to enable background model training.")
+        redis_conn = None
+        task_queue = None
+else:
+    print("⚠️  Warning: rq/redis packages not installed. Background jobs will not work.")
+    print("   Install with: pip install rq redis")
 
 # Helper Functions
 def calculate_risk_levels(locations, score_column='risk_score'):
@@ -695,7 +712,11 @@ def _find_latest_model(model_name='TabCmpt', municipio='blockCV'):
     Returns:
         tuple: (model_path, timestamp) or (None, None) if not found
     """
-    experiments_dir = './experiments'
+    # Get the parent directory (project root) where experiments folder is located
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(backend_dir)
+    experiments_dir = os.path.join(project_root, 'experiments')
+    
     if not os.path.exists(experiments_dir):
         return None, None
     
@@ -711,18 +732,39 @@ def _find_latest_model(model_name='TabCmpt', municipio='blockCV'):
     
     # Look for model files in most recent experiments
     for exp_dir in exp_dirs:
-        # Try .pth for TabCmpt/MLP
-        if model_name in ['TabCmpt', 'MLP']:
-            model_path = os.path.join(exp_dir, f'{municipio}.pth')
-            if os.path.exists(model_path):
-                timestamp = os.path.basename(exp_dir)
-                return model_path, timestamp
-        # Try .pkl for other models
+        # For blockCV, models are saved with actual municipio names, not 'blockCV'
+        # So we need to find any .pth or .pkl file in the directory
+        if municipio == 'blockCV':
+            # Find any model file matching the model type
+            if model_name in ['TabCmpt', 'MLP', 'MLP_IRM']:
+                # Look for any .pth file
+                pth_files = glob.glob(os.path.join(exp_dir, '*.pth'))
+                if pth_files:
+                    # Use the first one found (or could use most recent)
+                    model_path = pth_files[0]
+                    timestamp = os.path.basename(exp_dir)
+                    print(f"  Found model file: {os.path.basename(model_path)}")
+                    return model_path, timestamp
+            else:
+                # Look for any .pkl file
+                pkl_files = glob.glob(os.path.join(exp_dir, '*.pkl'))
+                if pkl_files:
+                    model_path = pkl_files[0]
+                    timestamp = os.path.basename(exp_dir)
+                    print(f"  Found model file: {os.path.basename(model_path)}")
+                    return model_path, timestamp
         else:
-            model_path = os.path.join(exp_dir, f'{municipio}.pkl')
-            if os.path.exists(model_path):
-                timestamp = os.path.basename(exp_dir)
-                return model_path, timestamp
+            # For specific municipio, look for exact match
+            if model_name in ['TabCmpt', 'MLP', 'MLP_IRM']:
+                model_path = os.path.join(exp_dir, f'{municipio}.pth')
+                if os.path.exists(model_path):
+                    timestamp = os.path.basename(exp_dir)
+                    return model_path, timestamp
+            else:
+                model_path = os.path.join(exp_dir, f'{municipio}.pkl')
+                if os.path.exists(model_path):
+                    timestamp = os.path.basename(exp_dir)
+                    return model_path, timestamp
     
     return None, None
 
@@ -875,6 +917,36 @@ def recalculate_and_predict():
         
         print(f"  Found model: {model_path}")
         
+        # Determine actual model type from config.json if available
+        config_path = os.path.join(os.path.dirname(model_path), 'config.json')
+        actual_model_name = model_name  # Default to requested model
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    if 'model' in config:
+                        actual_model_name = config['model']
+                        print(f"  Detected model type from config: {actual_model_name}")
+            except Exception as e:
+                print(f"  ⚠️  Could not read config.json: {e}")
+        
+        # If config doesn't have model, try to detect from state_dict keys
+        if actual_model_name == model_name and TORCH_AVAILABLE:
+            try:
+                import torch
+                state_dict = torch.load(model_path, map_location='cpu')
+                state_keys = list(state_dict.keys())
+                # Check for MLP_IRM architecture (has "network." prefix)
+                if any('network.' in key for key in state_keys):
+                    actual_model_name = 'MLP_IRM'
+                    print(f"  Detected model type from state_dict: MLP_IRM")
+                # Check for TabCmpt architecture (has "attentive_transformer" or "mlp_steps")
+                elif any('attentive_transformer' in key or 'mlp_steps' in key for key in state_keys):
+                    actual_model_name = 'TabCmpt'
+                    print(f"  Detected model type from state_dict: TabCmpt")
+            except Exception as e:
+                print(f"  ⚠️  Could not detect model type from state_dict: {e}")
+        
         # Load model and make predictions
         # This is a simplified version - you may need to adjust based on your model structure
         try:
@@ -886,26 +958,195 @@ def recalculate_and_predict():
             from save_predictions_db import save_predictions_to_db_orm
             
             # Load dataset with updated dist_old_mine
-            # For prediction, we need all locations, so use a dummy validation municipio
-            print("  Loading dataset with updated features...")
-            train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']  # Default training set
-            val_municipio = municipio.upper() if municipio != 'blockCV' else 'BOLÍVAR'
+            # IMPORTANT: We need to predict on ALL locations, not just a validation split
+            print("  Loading dataset with updated features for ALL locations...")
+            train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']  # Default training set for normalization
             
-            # Create dataset for all locations (we'll predict on all)
-            # Note: This is a simplified approach - you may need to adjust based on your data structure
-            all_data = EventDB(
+            # Step 1: Load training data to get fitted scaler and imputer
+            print("  Step 1: Loading training data for feature normalization...")
+            train_data = EventDB(
                 train_municipios=train_municipios,
-                val_municipio=val_municipio,
+                val_municipio='RANDOM',
                 subset=subset,
-                split='val',
+                split='train',
                 db_url=DATABASE_URL
             )
             
-            # Load model based on type
-            if model_name in ['TabCmpt', 'MLP']:
+            # Step 2: Load ALL locations from database and merge with CSV
+            print("  Step 2: Loading ALL locations from database...")
+            # pandas is already imported at module level, but ensure it's available
+            from sqlalchemy import create_engine
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.impute import KNNImputer
+            
+            # Get all locations from database
+            engine = create_engine(DATABASE_URL)
+            all_db_locations = pd.read_sql("""
+                SELECT lon, lat, dist_old_mine 
+                FROM locations
+            """, engine)
+            print(f"    Found {len(all_db_locations)} locations in database")
+            
+            # Load CSV to get static features
+            current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            csv_path = os.path.join(current_dir, 'processed_dataset', 'resolution_0.5.csv')
+            csv_data = pd.read_csv(csv_path)
+            print(f"    Loaded {len(csv_data)} rows from CSV")
+            
+            # Merge database locations with CSV data on coordinates
+            csv_data['merge_key'] = csv_data.apply(
+                lambda row: f"{row['LONGITUD_X']:.6f}_{row['LATITUD_Y']:.6f}", axis=1
+            )
+            all_db_locations['merge_key'] = all_db_locations.apply(
+                lambda row: f"{row['lon']:.6f}_{row['lat']:.6f}", axis=1
+            )
+            
+            # Merge to get all features for database locations (keep all DB locations)
+            merged_all = csv_data.merge(
+                all_db_locations[['merge_key', 'dist_old_mine']],
+                on='merge_key',
+                how='right',  # Keep all database locations
+                suffixes=('_csv', '_db')
+            )
+            
+            # Use database dist_old_mine if available, otherwise CSV
+            if 'dist_old_mine_db' in merged_all.columns:
+                merged_all['dist_old_mine'] = merged_all['dist_old_mine_db'].fillna(
+                    merged_all.get('dist_old_mine_csv', pd.Series(dtype=float))
+                )
+            elif 'dist_old_mine_csv' in merged_all.columns:
+                merged_all['dist_old_mine'] = merged_all['dist_old_mine_csv']
+            
+            print(f"    Merged data: {len(merged_all)} locations with features")
+            
+            # Step 3: Apply same preprocessing as training data
+            print("  Step 3: Applying feature preprocessing...")
+            
+            # Get feature columns (same as training data)
+            if subset == 'full':
+                numeric_cols = train_data.numeric_cols
+                binary_cols = train_data.binary_cols
+            elif subset == 'geo':
+                numeric_cols = train_data.numeric_cols
+                binary_cols = train_data.binary_cols
+            elif subset == 'single':
+                numeric_cols = ['dist_old_mine']
+                binary_cols = []
+            else:
+                numeric_cols = train_data.numeric_cols
+                binary_cols = train_data.binary_cols
+            
+            features = numeric_cols + binary_cols
+            
+            # Apply get_dummies (same as EventDB)
+            tabX_all = pd.get_dummies(columns=['land_use', 'weather', 'relief'], data=merged_all)
+            
+            # Ensure all required features exist (add missing ones as 0)
+            for feat in features:
+                if feat not in tabX_all.columns:
+                    tabX_all[feat] = 0
+            
+            # Select only the features we need
+            tabX_all = tabX_all[features].copy()
+            
+            # Apply imputation (using fitted imputer from training data)
+            # We need to access the fitted imputer - let's refit it from training data
+            train_tabX_df = pd.DataFrame(train_data.tabX, columns=features)
+            imputer = KNNImputer(n_neighbors=4, weights='distance')
+            imputer.fit(train_tabX_df)
+            
+            # Transform all data
+            tabX_all_imputed = imputer.transform(tabX_all)
+            tabX_all_imputed = pd.DataFrame(tabX_all_imputed, columns=features, index=tabX_all.index)
+            
+            # Apply scaling (using fitted scaler from training data)
+            scaler = StandardScaler()
+            scaler.fit(train_tabX_df[numeric_cols])
+            tabX_all_imputed[numeric_cols] = scaler.transform(tabX_all_imputed[numeric_cols])
+            
+            # Convert to numpy array
+            X_all = tabX_all_imputed.values.astype(np.float32)
+            locations_all = merged_all[['LONGITUD_X', 'LATITUD_Y']].values
+            hist_mine_all = merged_all.get('0.5km_hist_mines', pd.Series(0, index=merged_all.index)).values
+            
+            print(f"  ✓ Prepared {len(X_all)} locations for prediction")
+            
+            # Create a simple data structure similar to EventDB for compatibility
+            class AllLocationsData:
+                def __init__(self, tabX, locations, hist_mine):
+                    self.tabX = tabX
+                    self.locations = locations
+                    self.hist_mine = hist_mine
+                    self.y = np.zeros(len(tabX))  # Dummy labels
+            
+            all_data = AllLocationsData(X_all, locations_all, hist_mine_all)
+            
+            # Load model based on actual detected type
+            if actual_model_name == 'MLP_IRM':
+                if not TORCH_AVAILABLE:
+                    raise ImportError("PyTorch is required for MLP_IRM model. Please install torch.")
+                
+                from model import MLP_IRM, MLP_IRM_Estimator, SimpleEvent
+                import torch
+                
+                # Load config to get model parameters
+                config_path = os.path.join(os.path.dirname(model_path), 'config.json')
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                
+                # Get number of features from data
+                num_features = all_data.tabX.shape[1]
+                hidden_dim = config.get('hidden_dim', 64)  # Default if not in config
+                
+                # Create model and estimator
+                device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                estimator = MLP_IRM_Estimator(
+                    num_features=num_features,
+                    hidden_dim=hidden_dim,
+                    device=device
+                )
+                
+                # Load state dict
+                estimator.model.load_state_dict(torch.load(model_path, map_location=device))
+                
+                # Prepare data as SimpleEvent
+                # For prediction, we need X, and dummy y and close_hist_mine
+                X = all_data.tabX
+                # X is already float32 from preprocessing
+                
+                dummy_y = np.zeros(len(X), dtype=np.float32)
+                # Get close_hist_mine from hist_mine (1 if dist < 0.5, 0 otherwise)
+                if hasattr(all_data, 'hist_mine'):
+                    # hist_mine is already the 0.5km_hist_mines feature
+                    # For close_hist_mine, we need dist_old_mine < 0.5
+                    # Find dist_old_mine column index
+                    dist_col_idx = None
+                    if hasattr(train_data, 'features'):
+                        if 'dist_old_mine' in train_data.features:
+                            dist_col_idx = train_data.features.index('dist_old_mine')
+                    elif hasattr(train_data, 'numeric_cols'):
+                        if 'dist_old_mine' in train_data.numeric_cols:
+                            dist_col_idx = train_data.numeric_cols.index('dist_old_mine')
+                    
+                    if dist_col_idx is not None and X.shape[1] > dist_col_idx:
+                        dummy_hist_mine = (X[:, dist_col_idx] < 0.5).astype(np.float32)
+                    else:
+                        # Fallback: use hist_mine directly (binary indicator)
+                        dummy_hist_mine = (all_data.hist_mine > 0).astype(np.float32)
+                else:
+                    dummy_hist_mine = np.zeros(len(X), dtype=np.float32)
+                
+                test_data = SimpleEvent(X, dummy_y, dummy_hist_mine)
+                
+                # Make predictions
+                print("  Making predictions with MLP_IRM...")
+                predictions = estimator.predict_proba(test_data)
+                
+            elif actual_model_name in ['TabCmpt', 'MLP']:
                 if not TORCH_AVAILABLE:
                     raise ImportError("PyTorch is required for TabCmpt/MLP models. Please install torch.")
                 
+                import torch
                 from reland import RELand
                 from model import TabCmpt, MLP
                 import argparse
@@ -932,7 +1173,16 @@ def recalculate_and_predict():
                 
                 # Make predictions
                 print("  Making predictions...")
-                predictions = model.predict_proba(test_dataset=all_data)
+                # RELand.predict_proba expects test_dataset with specific structure
+                # Create a compatible dataset wrapper
+                from torch.utils.data import TensorDataset, DataLoader
+                test_dataset = TensorDataset(
+                    torch.tensor(all_data.tabX, dtype=torch.float32),
+                    torch.tensor(all_data.y, dtype=torch.float32),
+                    torch.tensor(all_data.locations, dtype=torch.float32),
+                    torch.tensor(all_data.hist_mine, dtype=torch.float32)
+                )
+                predictions = model.predict_proba(test_dataset=test_dataset)
                 predictions = predictions[4]  # Get the probability array
                 
             elif model_name == 'TabNet':
@@ -955,9 +1205,16 @@ def recalculate_and_predict():
                 predictions = model.predict_proba(all_data.tabX)[:, 1]
             
             # Create predictions DataFrame
+            # Handle both EventDB format (2D array) and our custom format
+            if hasattr(all_data, 'locations') and len(all_data.locations.shape) == 2:
+                locations_array = all_data.locations
+            else:
+                # Fallback if locations is 1D or different format
+                locations_array = np.array([[loc[0], loc[1]] for loc in all_data.locations])
+            
             predictions_df = pd.DataFrame({
-                'LONGITUD_X': all_data.locations[:, 0],
-                'LATITUD_Y': all_data.locations[:, 1],
+                'LONGITUD_X': locations_array[:, 0],
+                'LATITUD_Y': locations_array[:, 1],
                 'predicted_proba': predictions
             })
             
@@ -1001,16 +1258,10 @@ def recalculate_and_predict():
 def retrain_model():
     """
     Retrain the model with updated labels and confirmed events.
-    This submits a background job and returns immediately.
-    Use /api/job_status/<job_id> to check progress.
+    If Redis is available, submits a background job and returns immediately.
+    If Redis is not available, runs training synchronously (may take several minutes).
     """
     try:
-        if not task_queue:
-            return jsonify({
-                "error": "Background job queue not available",
-                "message": "Redis is not configured. Set REDIS_URL environment variable."
-            }), 503
-        
         data = request.json or {}
         municipio = data.get('municipio', 'blockCV')
         subset = data.get('subset', 'full')
@@ -1018,366 +1269,76 @@ def retrain_model():
         objective = data.get('objective', 'irm')
         n_step = data.get('n_step', 2)
         
-        print(f"🔄 Submitting model training job...")
-        print(f"  Municipio: {municipio}")
-        print(f"  Subset: {subset}")
-        print(f"  Model: {model_name}")
-        print(f"  Objective: {objective}")
-        
-        # Import task function
-        from tasks import train_model_task
-        
-        # Submit job to queue
-        job = task_queue.enqueue(
-            train_model_task,
-            municipio=municipio,
-            subset=subset,
-            model_name=model_name,
-            objective=objective,
-            n_step=n_step,
-            db_url=DATABASE_URL,
-            job_timeout=3600,  # 1 hour timeout
-            result_ttl=86400   # Keep results for 24 hours
-        )
-        
-        return jsonify({
-            "message": "Model training job submitted successfully",
-            "job_id": job.id,
-            "status": "queued",
-            "status_url": f"/api/job_status/{job.id}"
-        }), 202
-        
-        # First, recalculate distances if confirmed events exist
-        confirmed_events = ConfirmedEvent.query.all()
-        if len(confirmed_events) > 0:
-            print("  Recalculating distances first...")
-            # Handle case where dist_old_mine column doesn't exist yet
-            try:
-                all_locations = Location.query.all()
-            except Exception as db_error:
-                # If dist_old_mine column doesn't exist, use raw SQL to query without it
-                if 'dist_old_mine' in str(db_error) or 'UndefinedColumn' in str(db_error):
-                    print("  ⚠️  dist_old_mine column not found. Querying without it...")
-                    db.session.rollback()
-                    from sqlalchemy import text
-                    query = text("""
-                        SELECT id, lat, lon, municipio, risk_score, risk_score_lr, risk_level,
-                               elevation, rainfall, temperature, population_2012, hist_mines,
-                               created_at, updated_at
-                        FROM locations
-                    """)
-                    result = db.session.execute(query)
-                    # Convert to Location objects manually
-                    all_locations = []
-                    for row in result:
-                        loc = Location()
-                        loc.id = row.id
-                        loc.lat = row.lat
-                        loc.lon = row.lon
-                        loc.municipio = row.municipio
-                        loc.risk_score = row.risk_score
-                        loc.risk_score_lr = row.risk_score_lr
-                        loc.risk_level = row.risk_level
-                        loc.elevation = row.elevation
-                        loc.rainfall = row.rainfall
-                        loc.temperature = row.temperature
-                        loc.population_2012 = row.population_2012
-                        loc.hist_mines = row.hist_mines
-                        loc.created_at = row.created_at
-                        loc.updated_at = row.updated_at
-                        loc.dist_old_mine = None
-                        all_locations.append(loc)
-                else:
-                    db.session.rollback()
-                    raise
+        # If Redis is available, use background job
+        if task_queue and RQ_AVAILABLE:
+            print(f"🔄 Submitting model training job to background queue...")
+            print(f"  Municipio: {municipio}")
+            print(f"  Subset: {subset}")
+            print(f"  Model: {model_name}")
+            print(f"  Objective: {objective}")
             
-            if all_locations:
-                # Check if dist_old_mine column exists, if not, add it
-                from sqlalchemy import text, inspect
-                inspector = inspect(db.engine)
-                columns = [col['name'] for col in inspector.get_columns('locations')]
-                column_exists = 'dist_old_mine' in columns
-                
-                if not column_exists:
-                    print("  Adding dist_old_mine column to database...")
-                    db.session.execute(text("ALTER TABLE locations ADD COLUMN dist_old_mine FLOAT"))
-                    db.session.commit()
-                    column_exists = True
-                
-                grid_data = {
-                    'lat': [loc.lat for loc in all_locations],
-                    'lon': [loc.lon for loc in all_locations]
-                }
-                grid_df = pd.DataFrame(grid_data)
-                
-                poi_data = {
-                    'lat': [event.lat for event in confirmed_events],
-                    'lon': [event.lon for event in confirmed_events]
-                }
-                poi_df = pd.DataFrame(poi_data)
-                
-                distances = distance_to_closest_point(grid_df, poi_df)
-                
-                # Use bulk update for better performance
-                if column_exists:
-                    update_query = text("""
-                        UPDATE locations 
-                        SET dist_old_mine = :distance 
-                        WHERE id = :location_id
-                    """)
-                    for i, location in enumerate(all_locations):
-                        db.session.execute(
-                            update_query,
-                            {'distance': float(distances[i]), 'location_id': location.id}
-                        )
-                    db.session.commit()
-                else:
-                    for i, location in enumerate(all_locations):
-                        location.dist_old_mine = float(distances[i])
-                    db.session.commit()
-                print("  ✓ Distances recalculated")
-        
-        # Generate timestamp for this training run
-        timestamp = datetime.now().strftime("%m%d%Y%H%M%S")
-        
-        # Create experiments directory if it doesn't exist
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        experiments_dir = os.path.join(script_dir, 'experiments')
-        os.makedirs(experiments_dir, exist_ok=True)
-        os.makedirs(os.path.join(experiments_dir, timestamp), exist_ok=True)
-        
-        # Prepare command to run main.py
-        main_script = os.path.join(script_dir, 'main.py')
-        
-        if not os.path.exists(main_script):
-            return jsonify({
-                "error": f"main.py not found at {main_script}"
-            }), 404
-        
-        # Verify train_val_stream directory exists
-        train_val_dir = os.path.join(script_dir, 'train_val_stream', municipio)
-        if not os.path.exists(train_val_dir):
-            return jsonify({
-                "error": f"Train/val split directory not found: {train_val_dir}",
-                "available_directories": [d for d in os.listdir(os.path.join(script_dir, 'train_val_stream')) if os.path.isdir(os.path.join(script_dir, 'train_val_stream', d))]
-            }), 404
-        
-        # Find Python interpreter with ML dependencies (torch, etc.)
-        # main.py needs torch and other ML libraries
-        # Prefer project-level ML venv, then system Python (avoid backend venv)
-        
-        python_interpreter = None
-        backend_venv_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # First, check for ML venv in project root (preferred)
-        ml_venv_python = os.path.join(script_dir, 'ml_venv', 'bin', 'python')
-        if os.path.exists(ml_venv_python):
-            # Verify it has torch
-            try:
-                check_result = subprocess.run(
-                    [ml_venv_python, '-c', 'import torch; print("OK")'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3
-                )
-                if check_result.returncode == 0:
-                    python_interpreter = ml_venv_python
-                    print(f"  ✓ Using ML venv Python: {python_interpreter}")
-            except:
-                pass
-        
-        # If ML venv not found or doesn't have torch, try system Python paths
-        if not python_interpreter:
-            system_python_paths = [
-                '/opt/homebrew/bin/python3',
-                '/usr/local/bin/python3',
-                '/usr/bin/python3',
-            ]
+            # Import task function
+            from tasks import train_model_task
             
-            for python_path in system_python_paths:
-                if os.path.exists(python_path):
-                    # Resolve symlinks to get real path
-                    try:
-                        real_path = os.path.realpath(python_path)
-                        # Check it's not inside the backend venv
-                        if 'reland-backend' not in real_path or 'venv' not in real_path:
-                            python_interpreter = python_path
-                            print(f"  Using system Python: {python_interpreter}")
-                            break
-                    except:
-                        # If realpath fails, just use it if it exists
-                        python_interpreter = python_path
-                        print(f"  Using system Python: {python_interpreter}")
-                        break
-        
-        # If we still don't have one, try to find python3 while explicitly avoiding venv
-        if not python_interpreter:
-            try:
-                # Use /usr/bin/env with a clean environment (no venv activation)
-                env = os.environ.copy()
-                # Remove VIRTUAL_ENV to avoid venv activation
-                env.pop('VIRTUAL_ENV', None)
-                env.pop('VIRTUAL_ENV_PROMPT', None)
-                # Remove backend venv from PATH
-                if 'PATH' in env:
-                    paths = env['PATH'].split(os.pathsep)
-                    paths = [p for p in paths if 'reland-backend/venv' not in p]
-                    env['PATH'] = os.pathsep.join(paths)
-                
-                result = subprocess.run(
-                    ['/usr/bin/env', 'python3', '--version'],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                    env=env
-                )
-                if result.returncode == 0:
-                    # Get the actual path
-                    which_result = subprocess.run(
-                        ['/usr/bin/env', 'which', 'python3'],
-                        capture_output=True,
-                        text=True,
-                        timeout=2,
-                        env=env
-                    )
-                    if which_result.returncode == 0:
-                        candidate = which_result.stdout.strip()
-                        # Double-check it's not the backend venv
-                        if 'reland-backend/venv' not in candidate:
-                            python_interpreter = candidate
-                            print(f"  Using Python from PATH: {python_interpreter}")
-            except:
-                pass
-        
-        # Last resort: use /opt/homebrew/bin/python3 if it exists (common on macOS)
-        if not python_interpreter and os.path.exists('/opt/homebrew/bin/python3'):
-            python_interpreter = '/opt/homebrew/bin/python3'
-            print(f"  Using fallback Python: {python_interpreter}")
-        
-        # Verify torch is available
-        if python_interpreter:
-            torch_available = False
-            try:
-                check_result = subprocess.run(
-                    [python_interpreter, '-c', 'import torch; print("OK")'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3
-                )
-                if check_result.returncode == 0:
-                    torch_available = True
-                    print(f"  ✓ Verified: torch is available")
-            except:
-                pass
-            
-            if not torch_available:
-                print(f"  ❌ ERROR: torch not found in {python_interpreter}")
-                print(f"  Please install torch: {python_interpreter} -m pip install torch")
-                return jsonify({
-                    "error": "PyTorch (torch) is not installed in the selected Python interpreter",
-                    "python_interpreter": python_interpreter,
-                    "solution": f"Install torch with: {python_interpreter} -m pip install torch",
-                    "note": "The training script requires torch. Install it in the system Python, not the backend venv."
-                }), 500
-        else:
-            return jsonify({
-                "error": "Could not find a suitable Python interpreter",
-                "note": "Please ensure system Python (not backend venv) is available and has torch installed."
-            }), 500
-        
-        # Build command
-        cmd = [
-            python_interpreter, main_script,
-            '--timestamp', timestamp,
-            '--municipio', municipio,
-            '--subset', subset,
-            '--model', model_name,
-            '--objective', objective,
-            '--n_step', str(n_step)
-        ]
-        
-        # Set environment variables for database access
-        env = os.environ.copy()
-        if DATABASE_URL:
-            env['DATABASE_URL'] = DATABASE_URL
-        
-        print(f"  Running command: {' '.join(cmd)}")
-        print(f"  Working directory: {script_dir}")
-        print(f"  This may take several minutes...")
-        
-        # Run the training script
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=script_dir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=3600  # 1 hour timeout
+            # Submit job to queue
+            job = task_queue.enqueue(
+                train_model_task,
+                municipio=municipio,
+                subset=subset,
+                model_name=model_name,
+                objective=objective,
+                n_step=n_step,
+                db_url=DATABASE_URL,
+                job_timeout=3600,  # 1 hour timeout
+                result_ttl=86400   # Keep results for 24 hours
             )
-        except subprocess.TimeoutExpired:
+            
             return jsonify({
-                "error": "Model training timed out (exceeded 1 hour)",
-                "note": "Training may still be running in the background. Check logs."
-            }), 500
+                "message": "Model training job submitted successfully",
+                "job_id": job.id,
+                "status": "queued",
+                "status_url": f"/api/job_status/{job.id}",
+                "mode": "background"
+            }), 202
         
-        if result.returncode != 0:
-            error_msg = result.stderr or result.stdout
-            print(f"  ❌ Training failed with return code {result.returncode}")
-            print(f"  STDOUT:\n{result.stdout}")
-            print(f"  STDERR:\n{result.stderr}")
+        # Otherwise, run synchronously
+        else:
+            print(f"🔄 Starting model training (synchronous mode - this may take several minutes)...")
+            print(f"  Municipio: {municipio}")
+            print(f"  Subset: {subset}")
+            print(f"  Model: {model_name}")
+            print(f"  Objective: {objective}")
+            print(f"  Note: Running without Redis - training will block until complete")
             
-            # Check for common errors and provide helpful messages
-            error_lower = error_msg.lower()
-            helpful_hint = None
+            # Import task function and run it directly
+            from tasks import train_model_task
             
-            if 'modulenotfounderror' in error_lower and 'torch' in error_lower:
-                helpful_hint = (
-                    "PyTorch (torch) is not installed. "
-                    "Install it with: pip install torch "
-                    "Or install all ML dependencies in your Python environment."
-                )
-            elif 'modulenotfounderror' in error_lower:
-                missing_module = error_msg.split("'")[1] if "'" in error_msg else "unknown module"
-                helpful_hint = f"Missing Python module: {missing_module}. Install it with: pip install {missing_module}"
+            # Run the training task synchronously
+            result = train_model_task(
+                municipio=municipio,
+                subset=subset,
+                model_name=model_name,
+                objective=objective,
+                n_step=n_step,
+                db_url=DATABASE_URL
+            )
             
-            # Try to extract the most relevant error message
-            error_lines = error_msg.split('\n')
-            relevant_error = '\n'.join(error_lines[-20:])  # Last 20 lines usually contain the error
-            
-            response_data = {
-                "error": "Model training failed",
-                "return_code": result.returncode,
-                "details": relevant_error[:1000],  # Limit error message length
-                "full_stderr": result.stderr[:2000] if result.stderr else None,
-                "full_stdout": result.stdout[:2000] if result.stdout else None
-            }
-            
-            if helpful_hint:
-                response_data["hint"] = helpful_hint
-            
-            return jsonify(response_data), 500
-        
-        print(f"  ✓ Model training completed")
-        print(f"  Results saved to: ./experiments/{timestamp}/")
-        
-        # Try to load and save predictions to database
-        try:
-            predicted_proba_path = os.path.join(script_dir, f'experiments/{timestamp}/predicted_proba.csv')
-            if os.path.exists(predicted_proba_path):
-                predictions_df = pd.read_csv(predicted_proba_path)
-                from save_predictions_db import save_predictions_to_db_orm
-                save_predictions_to_db_orm(predictions_df, db.session, Location)
-                print(f"  ✓ Predictions saved to database")
-        except Exception as e:
-            print(f"  ⚠️  Could not save predictions to database: {str(e)}")
-        
-        return jsonify({
-            "message": "Model retraining completed successfully",
-            "timestamp": timestamp,
-            "experiment_dir": f"./experiments/{timestamp}/",
-            "predictions_saved": os.path.exists(predicted_proba_path) if 'predicted_proba_path' in locals() else False
-        }), 200
+            # Return the result
+            if result.get('status') == 'completed':
+                return jsonify({
+                    "message": "Model training completed successfully",
+                    "timestamp": result.get('timestamp'),
+                    "experiment_dir": result.get('experiment_dir'),
+                    "predictions_saved": result.get('predictions_saved', False),
+                    "mode": "synchronous"
+                }), 200
+            else:
+                return jsonify({
+                    "error": result.get('error', 'Model training failed'),
+                    "details": result.get('details'),
+                    "timestamp": result.get('timestamp'),
+                    "mode": "synchronous"
+                }), 500
         
     except Exception as e:
         import traceback
@@ -1393,10 +1354,10 @@ def get_job_status(job_id):
     Returns: queued, started, finished, failed, or not_found
     """
     try:
-        if not redis_conn:
+        if not RQ_AVAILABLE or not redis_conn:
             return jsonify({
                 "error": "Redis not available",
-                "message": "Cannot check job status without Redis"
+                "message": "Cannot check job status without Redis. Install rq and redis packages."
             }), 503
         
         job = Job.fetch(job_id, connection=redis_conn)
@@ -1516,40 +1477,36 @@ def list_jobs():
         
     except Exception as e:
         import traceback
-        print(f"Error listing jobs: {str(e)}")
+        print(f"Error in list_jobs: {str(e)}")
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
 def _ensure_confirmed_event(location_id, location):
     """Helper function to ensure a confirmed event exists for a location with label=1"""
-    existing_event = ConfirmedEvent.query.filter_by(
-        location_id=location_id,
-        source='user_label'
-    ).first()
-    
-    if not existing_event:
-        event = ConfirmedEvent(
-            lat=location.lat,
-            lon=location.lon,
-            municipio=location.municipio,
-            source='user_label',
-            location_id=location_id,
-            description='Confirmed mine event from user label'
-        )
-        db.session.add(event)
-        db.session.commit()
+    # Check if user label exists and is 1 (we're only called when label=1, but double-check)
+    user_label = UserLabel.query.filter_by(location_id=location_id).first()
+    if user_label and user_label.label == 1:
+        # Check if confirmed event already exists
+        existing_event = ConfirmedEvent.query.filter_by(location_id=location_id).first()
+        if not existing_event:
+            # Create new confirmed event
+            new_event = ConfirmedEvent(
+                location_id=location_id,
+                lat=location.lat,
+                lon=location.lon,
+                municipio=location.municipio,
+                source='user_label'
+            )
+            db.session.add(new_event)
+            db.session.commit()
 
 
 def _remove_confirmed_event_from_label(location_id):
     """Helper function to remove confirmed event when label is changed from 1 to 0"""
-    existing_event = ConfirmedEvent.query.filter_by(
-        location_id=location_id,
-        source='user_label'
-    ).first()
-    
-    if existing_event:
-        db.session.delete(existing_event)
+    event = ConfirmedEvent.query.filter_by(location_id=location_id).first()
+    if event:
+        db.session.delete(event)
         db.session.commit()
 
 
@@ -1560,13 +1517,12 @@ if __name__ == '__main__':
         # Get database stats
         try:
             location_count = Location.query.count()
-            area_count = db.session.query(Location.municipio).distinct().count()
+            area_count = len(get_all_municipality_names())
             label_count = UserLabel.query.count()
             event_count = ConfirmedEvent.query.count()
-        except Exception:
+        except:
             location_count = area_count = label_count = event_count = 0
         
-        print("\n" + "="*50)
         print("🚀 RELand Backend Server")
         print("="*50)
         # Mask password in connection string for security

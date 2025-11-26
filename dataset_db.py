@@ -40,7 +40,12 @@ class EventDB(Dataset):
             raise ValueError("DATABASE_URL environment variable not set")
         
         # Load static features from CSV (fast, one-time read)
-        data_path = './processed_dataset/resolution_0.5.csv'
+        # Resolve path relative to project root
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        data_path = os.path.join(current_dir, 'processed_dataset', 'resolution_0.5.csv')
+        if not os.path.exists(data_path):
+            # Fallback to relative path
+            data_path = './processed_dataset/resolution_0.5.csv'
         print(f"Loading static features from CSV: {data_path}")
         data = pd.read_csv(data_path)
         print(f"  Loaded {len(data)} rows from CSV")
@@ -59,6 +64,37 @@ class EventDB(Dataset):
         """
         db_data = pd.read_sql(db_query, engine)
         print(f"  Loaded {len(db_data)} rows from database")
+        print(f"  Database columns: {list(db_data.columns)}")
+        
+        # Ensure column names match (handle case where SQL aliases might not work or are lowercased)
+        # Some database drivers may not respect SQL aliases, or PostgreSQL may lowercase them
+        column_mapping = {}
+        
+        # Check for various possible column name formats
+        if 'LONGITUD_X' in db_data.columns:
+            # Already correct
+            pass
+        elif 'longitud_x' in db_data.columns:
+            column_mapping['longitud_x'] = 'LONGITUD_X'
+        elif 'lon' in db_data.columns:
+            column_mapping['lon'] = 'LONGITUD_X'
+        else:
+            raise ValueError(f"Expected 'LONGITUD_X', 'longitud_x', or 'lon' column in database query result. Got columns: {list(db_data.columns)}")
+        
+        if 'LATITUD_Y' in db_data.columns:
+            # Already correct
+            pass
+        elif 'latitud_y' in db_data.columns:
+            column_mapping['latitud_y'] = 'LATITUD_Y'
+        elif 'lat' in db_data.columns:
+            column_mapping['lat'] = 'LATITUD_Y'
+        else:
+            raise ValueError(f"Expected 'LATITUD_Y', 'latitud_y', or 'lat' column in database query result. Got columns: {list(db_data.columns)}")
+        
+        # Apply renaming if needed
+        if column_mapping:
+            db_data = db_data.rename(columns=column_mapping)
+            print(f"  Renamed columns: {column_mapping}")
         
         # Merge database data with CSV data on coordinates
         # Use a tolerance for coordinate matching (0.0001 degrees ≈ 11 meters)
