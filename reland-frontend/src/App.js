@@ -143,6 +143,9 @@ function App() {
   // Loading state for recalculation and retraining
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [isRetraining, setIsRetraining] = useState(false);
+  
+  // Legend visibility state
+  const [showLegend, setShowLegend] = useState(true);
 
   
   // --- Data Fetching (Side Effects) ---
@@ -918,6 +921,77 @@ function App() {
     fetchConfirmedEvents();
   }, []);
 
+  // Fix layer ordering: Ensure borders are always rendered after predictions
+  // Use useEffect to reorder layers after both are loaded
+  useEffect(() => {
+    if (!mapRef.current || !mapReady) return;
+    
+    const map = mapRef.current.getMap();
+    if (!map || !map.isStyleLoaded()) return;
+    
+    // Wait for both layers to exist
+    const timeoutId = setTimeout(() => {
+      try {
+        const predictionLayer = map.getLayer('prediction-points');
+        const borderFillLayer = map.getLayer('municipality-borders-fill');
+        const borderOutlineLayer = map.getLayer('municipality-borders-outline');
+        
+        if (predictionLayer && (borderFillLayer || borderOutlineLayer)) {
+          // Move border layers to be after prediction layer
+          // moveLayer(id, beforeId) moves id before beforeId
+          // To move after prediction, we need to find what comes after prediction
+          const layers = map.getStyle().layers;
+          const predictionIndex = layers.findIndex(l => l.id === 'prediction-points');
+          
+          if (predictionIndex >= 0) {
+            // Find the first layer after prediction that's not a border layer
+            let targetBeforeId = null;
+            for (let i = predictionIndex + 1; i < layers.length; i++) {
+              const layerId = layers[i].id;
+              if (layerId !== 'municipality-borders-fill' && 
+                  layerId !== 'municipality-borders-outline') {
+                targetBeforeId = layerId;
+                break;
+              }
+            }
+            
+            // Move border fill to be right after prediction
+            if (borderFillLayer) {
+              if (targetBeforeId) {
+                map.moveLayer('municipality-borders-fill', targetBeforeId);
+              }
+            }
+            
+            // Move border outline to be after fill
+            if (borderOutlineLayer) {
+              const fillIndex = layers.findIndex(l => l.id === 'municipality-borders-fill');
+              if (fillIndex >= 0) {
+                // Find what comes after fill
+                let outlineTargetBeforeId = null;
+                for (let i = fillIndex + 1; i < layers.length; i++) {
+                  if (layers[i].id !== 'municipality-borders-outline') {
+                    outlineTargetBeforeId = layers[i].id;
+                    break;
+                  }
+                }
+                if (outlineTargetBeforeId) {
+                  map.moveLayer('municipality-borders-outline', outlineTargetBeforeId);
+                }
+              } else if (targetBeforeId) {
+                // No fill layer, move outline after prediction
+                map.moveLayer('municipality-borders-outline', targetBeforeId);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Silently fail - layers might already be in correct order
+      }
+    }, 300); // Delay to ensure layers are added
+    
+    return () => clearTimeout(timeoutId);
+  }, [predictionData, municipalityBorders, mapReady, mapStyle]);
+
   // Function to load custom icons - reusable for map load and style changes
   const loadCustomIcons = useCallback(() => {
     if (!mapRef.current) return;
@@ -1248,7 +1322,7 @@ function App() {
               opacity: isRecalculating ? 0.6 : 1
             }}
           >
-            {isRecalculating ? 'Recalculating...' : '🔄 Recalculate & Re-predict'}
+            {isRecalculating ? 'Recalculating...' : 'Recalculate & Re-predict'}
           </button>
           <div style={{ 
             fontSize: '11px', 
@@ -1273,7 +1347,7 @@ function App() {
               opacity: isRetraining ? 0.6 : 1
             }}
           >
-            {isRetraining ? 'Retraining Model...' : '🎯 Retrain Model'}
+            {isRetraining ? 'Retraining Model...' : 'Retrain Model'}
           </button>
           <div style={{ 
             fontSize: '11px', 
@@ -1433,21 +1507,335 @@ function App() {
             </Source>
           )}
           
-          {/* Debug: Show prediction data count */}
-          {showPrediction && predictionData && (
-            <div style={{
-              position: 'absolute',
-              bottom: 10,
-              left: 10,
-              background: 'rgba(255,255,255,0.8)',
-              padding: '5px 10px',
-              borderRadius: '5px',
-              fontSize: '12px',
-              zIndex: 1000
+          {/* Enhanced Color Map Legend */}
+          <div style={{
+            position: 'absolute',
+            bottom: 10,
+            left: 10,
+            background: 'linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(248,249,250,0.98) 100%)',
+            padding: showLegend ? '20px' : '0',
+            borderRadius: '12px',
+            boxShadow: '0 4px 20px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05)',
+            fontSize: '13px',
+            zIndex: 1000,
+            minWidth: showLegend ? '280px' : '50px',
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+            transition: 'all 0.3s ease',
+            backdropFilter: 'blur(10px)',
+            overflow: 'hidden'
+          }}>
+            {/* Header with Toggle */}
+            <div style={{ 
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: showLegend ? '15px' : '0',
+              paddingBottom: showLegend ? '12px' : '0',
+              borderBottom: showLegend ? '2px solid #e9ecef' : 'none',
+              transition: 'all 0.3s ease'
             }}>
-              Showing {predictionData.features.length} prediction points
+              <div style={{ 
+                fontWeight: '700', 
+                fontSize: '16px',
+                color: '#212529',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px'
+              }}>
+                {showLegend && <span>🎨</span>}
+                {showLegend && <span>Color Map</span>}
+              </div>
+              <button
+                onClick={() => setShowLegend(!showLegend)}
+                style={{
+                  background: showLegend ? '#6c757d' : '#007bff',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '6px 12px',
+                  cursor: 'pointer',
+                  fontSize: '12px',
+                  fontWeight: '600',
+                  transition: 'all 0.2s ease',
+                  boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                }}
+                onMouseOver={(e) => e.target.style.transform = 'scale(1.05)'}
+                onMouseOut={(e) => e.target.style.transform = 'scale(1)'}
+              >
+                {showLegend ? '−' : '⚡'}
+              </button>
             </div>
-          )}
+            
+            {showLegend && (
+              <div style={{ animation: 'fadeIn 0.3s ease' }}>
+                {/* Risk Prediction Legend with Gradient */}
+                {showPrediction && (
+                  <div style={{ 
+                    marginBottom: '18px',
+                    padding: '12px',
+                    background: 'linear-gradient(135deg, rgba(0,123,255,0.05) 0%, rgba(0,123,255,0.02) 100%)',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(0,123,255,0.1)'
+                  }}>
+                    <div style={{ 
+                      fontWeight: '700', 
+                      marginBottom: '10px', 
+                      color: '#007bff',
+                      fontSize: '14px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px'
+                    }}>
+                      <span>📍</span>
+                      <span>Risk Prediction</span>
+                    </div>
+                    
+                    {/* Gradient Bar */}
+                    <div style={{
+                      height: '24px',
+                      background: 'linear-gradient(to right, rgb(28,238,238) 0%, yellow 50%, red 100%)',
+                      borderRadius: '6px',
+                      marginBottom: '10px',
+                      boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.1)',
+                      border: '1px solid rgba(0,0,0,0.1)',
+                      position: 'relative',
+                      overflow: 'hidden'
+                    }}>
+                      <div style={{
+                        position: 'absolute',
+                        left: '33%',
+                        top: 0,
+                        bottom: 0,
+                        width: '1px',
+                        background: 'rgba(255,255,255,0.8)',
+                        boxShadow: '0 0 2px rgba(0,0,0,0.3)'
+                      }}></div>
+                      <div style={{
+                        position: 'absolute',
+                        left: '67%',
+                        top: 0,
+                        bottom: 0,
+                        width: '1px',
+                        background: 'rgba(255,255,255,0.8)',
+                        boxShadow: '0 0 2px rgba(0,0,0,0.3)'
+                      }}></div>
+                    </div>
+                    
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#6c757d', marginBottom: '8px' }}>
+                      <span>Low</span>
+                      <span>Medium</span>
+                      <span>High</span>
+                    </div>
+                    
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px', marginTop: '8px' }}>
+                      <div style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        padding: '6px',
+                        background: 'rgba(28,238,238,0.1)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{
+                          width: '20px',
+                          height: '20px',
+                          backgroundColor: 'rgb(28,238,238)',
+                          border: '2px solid white',
+                          borderRadius: '4px',
+                          marginBottom: '4px',
+                          boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#495057' }}>Low</span>
+                      </div>
+                      <div style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        padding: '6px',
+                        background: 'rgba(255,255,0,0.1)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{
+                          width: '20px',
+                          height: '20px',
+                          backgroundColor: 'yellow',
+                          border: '2px solid white',
+                          borderRadius: '4px',
+                          marginBottom: '4px',
+                          boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#495057' }}>Medium</span>
+                      </div>
+                      <div style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        padding: '6px',
+                        background: 'rgba(255,0,0,0.1)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{
+                          width: '20px',
+                          height: '20px',
+                          backgroundColor: 'red',
+                          border: '2px solid white',
+                          borderRadius: '4px',
+                          marginBottom: '4px',
+                          boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#495057' }}>High</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Confirmed Events Legend */}
+                {showConfirmedEvents && (
+                  <div style={{ 
+                    marginBottom: '18px',
+                    padding: '12px',
+                    background: 'linear-gradient(135deg, rgba(220,53,69,0.05) 0%, rgba(220,53,69,0.02) 100%)',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(220,53,69,0.1)'
+                  }}>
+                    <div style={{ 
+                      fontWeight: '700', 
+                      marginBottom: '10px', 
+                      color: '#dc3545',
+                      fontSize: '14px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px'
+                    }}>
+                      <span>⚠️</span>
+                      <span>Confirmed Events</span>
+                    </div>
+                    <div style={{ 
+                      display: 'flex', 
+                      alignItems: 'center',
+                      padding: '8px',
+                      background: 'rgba(255,255,255,0.5)',
+                      borderRadius: '6px'
+                    }}>
+                      <svg width="20" height="20" style={{ marginRight: '10px', filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.2))' }}>
+                        <polygon 
+                          points="10,3 17,17 3,17" 
+                          fill="#ff0000" 
+                          stroke="white" 
+                          strokeWidth="2"
+                        />
+                      </svg>
+                      <span style={{ fontWeight: '600', color: '#495057' }}>Confirmed Mine Event</span>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Historical Events Legend */}
+                {showHistorical.length > 0 && (
+                  <div style={{ 
+                    marginBottom: '18px',
+                    padding: '12px',
+                    background: 'linear-gradient(135deg, rgba(108,117,125,0.05) 0%, rgba(108,117,125,0.02) 100%)',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(108,117,125,0.1)'
+                  }}>
+                    <div style={{ 
+                      fontWeight: '700', 
+                      marginBottom: '10px', 
+                      color: '#6c757d',
+                      fontSize: '14px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px'
+                    }}>
+                      <span>📊</span>
+                      <span>Historical Events</span>
+                    </div>
+                    {showHistorical.includes(-1) && (
+                      <div style={{ 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        marginBottom: '6px',
+                        padding: '6px',
+                        background: 'rgba(255,255,255,0.5)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '50%',
+                          backgroundColor: '#808080',
+                          marginRight: '10px',
+                          border: '2px solid white',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '12px', color: '#495057' }}>No Historical Data</span>
+                      </div>
+                    )}
+                    {showHistorical.includes(0) && (
+                      <div style={{ 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        marginBottom: '6px',
+                        padding: '6px',
+                        background: 'rgba(255,255,255,0.5)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '50%',
+                          backgroundColor: '#28a745',
+                          marginRight: '10px',
+                          border: '2px solid white',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '12px', color: '#495057' }}>Mine-Free Area</span>
+                      </div>
+                    )}
+                    {showHistorical.includes(1) && (
+                      <div style={{ 
+                        display: 'flex', 
+                        alignItems: 'center',
+                        padding: '6px',
+                        background: 'rgba(255,255,255,0.5)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '50%',
+                          backgroundColor: '#dc3545',
+                          marginRight: '10px',
+                          border: '2px solid white',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '12px', color: '#495057' }}>Affected by Landmines</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                
+                {/* Data count info */}
+                {showPrediction && predictionData && (
+                  <div style={{ 
+                    marginTop: '12px', 
+                    paddingTop: '12px', 
+                    borderTop: '2px solid #e9ecef',
+                    fontSize: '11px',
+                    color: '#6c757d',
+                    textAlign: 'center',
+                    fontWeight: '500',
+                    background: 'rgba(0,123,255,0.05)',
+                    padding: '8px',
+                    borderRadius: '6px'
+                  }}>
+                    📍 Showing <strong>{predictionData.features.length.toLocaleString()}</strong> prediction points
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           {/* 2. Historical Layer - commented out for now */}
           {/* {historicalData && (
@@ -1461,7 +1849,8 @@ function App() {
           )} */}
 
           {/* 2.5. Municipality Borders Layer - Render AFTER predictions so borders appear on top */}
-          {municipalityBorders && (
+          {/* Only render borders when predictions are ready to ensure correct layer ordering */}
+          {municipalityBorders && predictionData && (
             <Source 
               key={`borders-${mapStyle}`}
               type="geojson" 

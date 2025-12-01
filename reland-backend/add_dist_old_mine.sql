@@ -8,3 +8,6 @@ SELECT column_name, data_type
 FROM information_schema.columns 
 WHERE table_name = 'locations' AND column_name = 'dist_old_mine';
 
+
+
+
