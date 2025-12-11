@@ -40,7 +40,35 @@ class EventDB(Dataset):
             raise ValueError("DATABASE_URL environment variable not set")
         
         # Load static features from CSV (fast, one-time read)
-        data_path = './processed_dataset/resolution_0.5.csv'
+        # Always use absolute paths to avoid issues with different working directories
+        # dataset_db.py is in project root, so processed_dataset should be in the same directory
+        current_file_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Try multiple possible locations (all as absolute paths)
+        possible_paths = [
+            os.path.join(current_file_dir, 'processed_dataset', 'resolution_0.5.csv'),  # Same directory as dataset_db.py
+            os.path.join(os.path.dirname(current_file_dir), 'processed_dataset', 'resolution_0.5.csv'),  # Parent directory
+            os.path.abspath(os.path.join(os.getcwd(), 'processed_dataset', 'resolution_0.5.csv')),  # Absolute from CWD
+        ]
+        
+        data_path = None
+        for path in possible_paths:
+            # Always convert to absolute path before checking
+            abs_path = os.path.abspath(path)
+            if os.path.exists(abs_path):
+                data_path = abs_path
+                break
+        
+        if not data_path:
+            raise FileNotFoundError(
+                f"Dataset file not found: resolution_0.5.csv\n"
+                f"Tried locations (all as absolute paths):\n" + 
+                "\n".join([f"  - {os.path.abspath(p)}" for p in possible_paths]) +
+                f"\n\nCurrent working directory: {os.getcwd()}\n"
+                f"dataset_db.py location: {current_file_dir}\n"
+                f"Please ensure processed_dataset/resolution_0.5.csv exists in the project root."
+            )
+        
         print(f"Loading static features from CSV: {data_path}")
         data = pd.read_csv(data_path)
         print(f"  Loaded {len(data)} rows from CSV")
@@ -59,6 +87,52 @@ class EventDB(Dataset):
         """
         db_data = pd.read_sql(db_query, engine)
         print(f"  Loaded {len(db_data)} rows from database")
+        print(f"  Database columns: {list(db_data.columns)}")
+        
+        # Handle case sensitivity - PostgreSQL may return lowercase column names
+        # Normalize column names to match expected format (uppercase)
+        column_mapping = {}
+        for col in db_data.columns:
+            col_upper = col.upper()
+            # Map to expected uppercase names
+            if col_upper == 'LONGITUD_X' or col == 'longitud_x' or col == 'lon':
+                column_mapping[col] = 'LONGITUD_X'
+            elif col_upper == 'LATITUD_Y' or col == 'latitud_y' or col == 'lat':
+                column_mapping[col] = 'LATITUD_Y'
+        
+        if column_mapping:
+            db_data = db_data.rename(columns=column_mapping)
+            print(f"  Renamed columns: {column_mapping}")
+        
+        # Verify required columns exist (check both original and mapped names)
+        required_cols = ['LONGITUD_X', 'LATITUD_Y']
+        missing_cols = [col for col in required_cols if col not in db_data.columns]
+        if missing_cols:
+            # Try to find alternative column names
+            available_cols_upper = [c.upper() for c in db_data.columns]
+            error_msg = (
+                f"Missing required columns in database query result: {missing_cols}\n"
+                f"Available columns: {list(db_data.columns)}\n"
+                f"Available columns (uppercase): {available_cols_upper}\n"
+            )
+            # Check if columns exist with different case
+            if 'LONGITUD_X' in missing_cols:
+                if 'longitud_x' in db_data.columns:
+                    db_data = db_data.rename(columns={'longitud_x': 'LONGITUD_X'})
+                    missing_cols.remove('LONGITUD_X')
+                elif 'lon' in db_data.columns:
+                    db_data = db_data.rename(columns={'lon': 'LONGITUD_X'})
+                    missing_cols.remove('LONGITUD_X')
+            if 'LATITUD_Y' in missing_cols:
+                if 'latitud_y' in db_data.columns:
+                    db_data = db_data.rename(columns={'latitud_y': 'LATITUD_Y'})
+                    missing_cols.remove('LATITUD_Y')
+                elif 'lat' in db_data.columns:
+                    db_data = db_data.rename(columns={'lat': 'LATITUD_Y'})
+                    missing_cols.remove('LATITUD_Y')
+            
+            if missing_cols:
+                raise ValueError(error_msg + "Please check the SQL query and database schema.")
         
         # Merge database data with CSV data on coordinates
         # Use a tolerance for coordinate matching (0.0001 degrees ≈ 11 meters)
@@ -182,44 +256,82 @@ class EventDB(Dataset):
                 val_tabX = tabX.loc[list(data[data['Municipio'] == val_municipio].index),self.features]
         else:
             train_tabX = tabX.loc[list(data[data['Municipio'].isin(train_municipios)].index),self.features]
-            val_tabX = tabX.loc[list(data[data['Municipio'] == val_municipio].index),self.features]
+            val_municipio_filtered = data[data['Municipio'] == val_municipio]
+            if len(val_municipio_filtered) == 0:
+                # If val_municipio not found, use all data for prediction (common for blockCV or when predicting on all locations)
+                print(f"  ⚠️  Warning: Municipio '{val_municipio}' not found in data. Using all locations for prediction.")
+                print(f"  Available municipios: {sorted(data['Municipio'].unique())}")
+                val_tabX = tabX.loc[:, self.features]  # Use all data
+            else:
+                val_tabX = tabX.loc[list(val_municipio_filtered.index),self.features]
         
         imputer = KNNImputer(n_neighbors = 4, weights = 'distance')
         train_imputer = imputer.fit(train_tabX)
         if len(np.where(np.isnan(train_tabX).any(axis=0))[0]) != 0:
             idx = np.where(np.isnan(train_tabX).any(axis=0))[0][0]  # find the nan column
             train_tabX.iloc[:,idx] = train_imputer.transform(train_tabX)[:,idx]
-            val_tabX.iloc[:,idx] = train_imputer.transform(val_tabX)[:,idx]
+            # Only transform val_tabX if it has data
+            if len(val_tabX) > 0:
+                val_tabX.iloc[:,idx] = train_imputer.transform(val_tabX)[:,idx]
+            else:
+                print(f"  ⚠️  Warning: val_tabX is empty for municipio '{val_municipio}'. Skipping imputation.")
+                print(f"  Available municipios in data: {sorted(data['Municipio'].unique())}")
         
         scaler = StandardScaler()
         train_scaler = scaler.fit(train_tabX[self.numeric_cols])
         train_tabX[self.numeric_cols] = train_scaler.transform(train_tabX[self.numeric_cols])
-        val_tabX[self.numeric_cols] = train_scaler.transform(val_tabX[self.numeric_cols])
+        # Only transform val_tabX if it has data
+        if len(val_tabX) > 0:
+            val_tabX[self.numeric_cols] = train_scaler.transform(val_tabX[self.numeric_cols])
+        else:
+            print(f"  ⚠️  Warning: val_tabX is empty. Cannot apply scaling.")
     
+        # Helper function to convert DataFrame to numeric numpy array
+        def to_numeric_array(df):
+            """Convert DataFrame to float32 numpy array, handling object dtype."""
+            if len(df) == 0:
+                return np.array([], dtype=np.float32).reshape(0, len(df.columns) if len(df.columns) > 0 else 0)
+            # Convert to numpy and ensure float32
+            arr = df.values
+            # If object dtype, convert to float explicitly
+            if arr.dtype == np.object_:
+                arr = arr.astype(np.float64)
+            # Convert to float32 for efficiency
+            return arr.astype(np.float32)
+        
         if self.split == 'val':
             if val_municipio == 'RANDOM':
                 # all train - train_idx
                 val_idx = train_tabX_combined.index[~train_tabX_combined.index.isin(train_idx)]
                 self.locations = all_locations[list(val_idx)]
-                self.y = data.loc[val_idx,'mines_outcome'].to_numpy()
-                self.tabX = val_tabX.to_numpy()
-                self.hist_mine = all_hist_mine[list(val_idx)]
+                self.y = data.loc[val_idx,'mines_outcome'].to_numpy().astype(np.float32)
+                self.tabX = to_numeric_array(val_tabX)
+                self.hist_mine = all_hist_mine[list(val_idx)].astype(np.float32)
             else:
-                self.locations = all_locations[list(data[data['Municipio'] == val_municipio].index)]
-                self.y = (data.loc[data['Municipio'] == val_municipio,'mines_outcome']).to_numpy()
-                self.tabX = val_tabX.to_numpy()
-                self.hist_mine = all_hist_mine[list(data[data['Municipio'] == val_municipio].index)]
+                val_municipio_filtered = data[data['Municipio'] == val_municipio]
+                if len(val_municipio_filtered) == 0:
+                    # If municipio not found, use all locations for prediction
+                    print(f"  Using all locations for prediction (municipio '{val_municipio}' not found)")
+                    self.locations = all_locations
+                    self.y = data['mines_outcome'].to_numpy().astype(np.float32)
+                    self.tabX = to_numeric_array(val_tabX)
+                    self.hist_mine = all_hist_mine.astype(np.float32)
+                else:
+                    self.locations = all_locations[list(val_municipio_filtered.index)]
+                    self.y = (data.loc[val_municipio_filtered.index,'mines_outcome']).to_numpy().astype(np.float32)
+                    self.tabX = to_numeric_array(val_tabX)
+                    self.hist_mine = all_hist_mine[list(val_municipio_filtered.index)].astype(np.float32)
         elif self.split == 'train': 
             if val_municipio == 'RANDOM' or val_municipio == 'PUERTO LIBERTADOR' or val_municipio == 'MURINDÓ':
                 self.locations = all_locations[list(train_idx)]
-                self.y = data.loc[train_idx,'mines_outcome'].to_numpy()
-                self.tabX = train_tabX.to_numpy()
-                self.hist_mine = all_hist_mine[list(train_idx)]
+                self.y = data.loc[train_idx,'mines_outcome'].to_numpy().astype(np.float32)
+                self.tabX = to_numeric_array(train_tabX)
+                self.hist_mine = all_hist_mine[list(train_idx)].astype(np.float32)
             else:
                 self.locations = all_locations[list(data[data['Municipio'].isin(train_municipios)].index)]
-                self.y = (data.loc[data['Municipio'].isin(train_municipios),'mines_outcome']).to_numpy()
-                self.tabX = train_tabX.to_numpy()
-                self.hist_mine = all_hist_mine[list(data[data['Municipio'].isin(train_municipios)].index)]
+                self.y = (data.loc[data['Municipio'].isin(train_municipios),'mines_outcome']).to_numpy().astype(np.float32)
+                self.tabX = to_numeric_array(train_tabX)
+                self.hist_mine = all_hist_mine[list(data[data['Municipio'].isin(train_municipios)].index)].astype(np.float32)
        
         # for ood bench
         self.samples = [(self.tabX[i], self.y[i])for i in range(len(self.y))]
@@ -232,8 +344,15 @@ class EventDB(Dataset):
         hist_mine = self.hist_mine[idx]
         label = self.y[idx]
         tab_data = self.tabX[idx,:]
-        return  (torch.tensor(tab_data).float(),\
-                torch.tensor(label).float(), \
-                torch.tensor((lon, lat)).float(), \
-                torch.tensor(hist_mine).float())
+        
+        # Ensure tab_data is numeric (handle object dtype)
+        if tab_data.dtype == np.object_:
+            tab_data = tab_data.astype(np.float32)
+        elif not np.issubdtype(tab_data.dtype, np.number):
+            tab_data = np.array(tab_data, dtype=np.float32)
+        
+        return  (torch.tensor(tab_data, dtype=torch.float32),\
+                torch.tensor(label, dtype=torch.float32), \
+                torch.tensor((lon, lat), dtype=torch.float32), \
+                torch.tensor(hist_mine, dtype=torch.float32))
 

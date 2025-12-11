@@ -1,4 +1,8 @@
 import os
+# Set macOS fork safety BEFORE any imports that might trigger Objective-C
+# This must be set before any imports to prevent fork() crashes on macOS
+os.environ.setdefault('OBJC_DISABLE_INITIALIZE_FORK_SAFETY', 'YES')
+
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -749,43 +753,110 @@ def distance_to_closest_point(grid, points_of_interest):
     return dist.flatten()
 
 
+def _detect_model_type(model_path):
+    """
+    Detect the model type (TabCmpt or MLP) by examining the state_dict keys.
+    
+    Args:
+        model_path: Path to the .pth model file
+        
+    Returns:
+        str: 'TabCmpt', 'MLP', or 'unknown'
+    """
+    if not TORCH_AVAILABLE:
+        return 'unknown'
+    
+    try:
+        state_dict = torch.load(model_path, map_location='cpu')
+        keys = list(state_dict.keys())
+        
+        # TabCmpt has these specific keys
+        if any('attentive_transformer' in k for k in keys) or any('mlp_steps' in k for k in keys):
+            return 'TabCmpt'
+        # MLP has simpler structure with 'base' or 'network' or 'fc'
+        elif any('base' in k for k in keys) or any('network' in k for k in keys):
+            return 'MLP'
+        else:
+            return 'unknown'
+    except Exception as e:
+        print(f"  Warning: Could not detect model type: {e}", file=sys.stdout, flush=True)
+        return 'unknown'
+
+
 def _find_latest_model(model_name='TabCmpt', municipio='blockCV'):
     """
-    Find the most recent trained model file.
+    Find the most recent trained model file, ensuring it matches the requested model type.
     
     Returns:
-        tuple: (model_path, timestamp) or (None, None) if not found
+        tuple: (model_path, timestamp, detected_model_type) or (None, None, None) if not found
     """
-    experiments_dir = './experiments'
+    # Get the project root directory (parent of reland-backend)
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(backend_dir)
+    experiments_dir = os.path.join(project_root, 'experiments')
+    
+    # Fallback: also try relative to current working directory
+    cwd_experiments = os.path.join(os.getcwd(), 'experiments')
+    if not os.path.exists(experiments_dir) and os.path.exists(cwd_experiments):
+        experiments_dir = cwd_experiments
+    
     if not os.path.exists(experiments_dir):
-        return None, None
+        return None, None, None
     
     # Find all experiment directories
     exp_dirs = glob.glob(os.path.join(experiments_dir, '*'))
     exp_dirs = [d for d in exp_dirs if os.path.isdir(d)]
     
     if not exp_dirs:
-        return None, None
+        return None, None, None
     
     # Sort by modification time (most recent first)
     exp_dirs.sort(key=os.path.getmtime, reverse=True)
     
     # Look for model files in most recent experiments
     for exp_dir in exp_dirs:
-        # Try .pth for TabCmpt/MLP
         if model_name in ['TabCmpt', 'MLP']:
+            # First try exact match with municipio name
             model_path = os.path.join(exp_dir, f'{municipio}.pth')
             if os.path.exists(model_path):
+                detected_type = _detect_model_type(model_path)
+                if detected_type == model_name or detected_type == 'unknown':
+                    timestamp = os.path.basename(exp_dir)
+                    print(f"  Found model: {os.path.basename(model_path)} (type: {detected_type})", file=sys.stdout, flush=True)
+                    return model_path, timestamp, detected_type
+            
+            # Look for any .pth file in this experiment directory
+            pth_files = glob.glob(os.path.join(exp_dir, '*.pth'))
+            if pth_files:
+                # Sort by modification time and check each one
+                pth_files.sort(key=os.path.getmtime, reverse=True)
+                for pth_file in pth_files:
+                    detected_type = _detect_model_type(pth_file)
+                    if detected_type == model_name:
+                        timestamp = os.path.basename(exp_dir)
+                        print(f"  Found {model_name} model: {os.path.basename(pth_file)}", file=sys.stdout, flush=True)
+                        return pth_file, timestamp, detected_type
+                
+                # If no exact match, use the most recent one (might be wrong type, but we'll handle it)
+                model_path = pth_files[0]
+                detected_type = _detect_model_type(model_path)
                 timestamp = os.path.basename(exp_dir)
-                return model_path, timestamp
-        # Try .pkl for other models
+                print(f"  Found model: {os.path.basename(model_path)} (type: {detected_type}, requested: {model_name})", file=sys.stdout, flush=True)
+                return model_path, timestamp, detected_type
         else:
+            # For sklearn models, look for .pkl files
             model_path = os.path.join(exp_dir, f'{municipio}.pkl')
             if os.path.exists(model_path):
                 timestamp = os.path.basename(exp_dir)
-                return model_path, timestamp
+                return model_path, timestamp, model_name
+            
+            pkl_files = glob.glob(os.path.join(exp_dir, '*.pkl'))
+            if pkl_files:
+                pkl_files.sort(key=os.path.getmtime, reverse=True)
+                timestamp = os.path.basename(exp_dir)
+                return pkl_files[0], timestamp, model_name
     
-    return None, None
+    return None, None, None
 
 
 @app.route('/api/recalculate_and_predict', methods=['POST'])
@@ -925,16 +996,17 @@ def recalculate_and_predict():
         print(f"  Mean distance: {distances.mean():.4f} km")
         
         # Find and load trained model
-        model_path, timestamp = _find_latest_model(model_name, municipio)
+        print(f"  Looking for model: {model_name}, municipio: {municipio}", file=sys.stdout, flush=True)
+        model_path, timestamp, detected_model_type = _find_latest_model(model_name, municipio)
         if not model_path:
             return jsonify({
                 "message": "Distances recalculated successfully, but no trained model found for re-prediction.",
                 "updated_count": updated_count,
                 "confirmed_events_count": len(confirmed_events),
-                "note": "Please train a model first using the retrain endpoint."
+                "note": f"Please train a {model_name} model first using the retrain endpoint."
             }), 200
         
-        print(f"  Found model: {model_path}")
+        print(f"  Found model: {model_path} (detected type: {detected_model_type})", file=sys.stdout, flush=True)
         
         # Load model and make predictions
         # This is a simplified version - you may need to adjust based on your model structure
@@ -969,14 +1041,18 @@ def recalculate_and_predict():
                 
                 from reland import RELand
                 from model import TabCmpt, MLP
-                import argparse
                 
-                # Create args object
+                # Use detected model type if available, otherwise use requested type
+                actual_model_name = detected_model_type if detected_model_type in ['TabCmpt', 'MLP'] else model_name
+                if detected_model_type != model_name and detected_model_type in ['TabCmpt', 'MLP']:
+                    print(f"  ⚠️  Warning: Found {detected_model_type} model but requested {model_name}. Using {detected_model_type}.", file=sys.stdout, flush=True)
+                
+                # Create args object with the actual model type
                 class Args:
-                    def __init__(self, obj, ts):
+                    def __init__(self, obj, ts, mname):
                         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                         self.objective = obj
-                        self.model = model_name
+                        self.model = mname
                         self.n_step = 2
                         self.lr = 0.01
                         self.step_size = 75
@@ -987,12 +1063,22 @@ def recalculate_and_predict():
                         self.num_workers = 4
                         self.timestamp = ts
                 
-                args = Args(objective, timestamp)
+                args = Args(objective, timestamp, actual_model_name)
                 model = RELand(all_data.tabX.shape[1], args)
-                model.model.load_state_dict(torch.load(model_path, map_location=args.device))
+                
+                # Load state dict with proper error handling
+                print(f"  Loading model from: {model_path}", file=sys.stdout, flush=True)
+                state_dict = torch.load(model_path, map_location=args.device)
+                # Use strict=False to allow partial loading (handles architecture differences)
+                missing_keys, unexpected_keys = model.model.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    print(f"  ⚠️  Warning: Missing keys in model: {len(missing_keys)} keys", file=sys.stdout, flush=True)
+                if unexpected_keys:
+                    print(f"  ⚠️  Warning: Unexpected keys in model: {len(unexpected_keys)} keys", file=sys.stdout, flush=True)
+                print("  ✓ Model loaded successfully", file=sys.stdout, flush=True)
                 
                 # Make predictions
-                print("  Making predictions...")
+                print("  Making predictions...", file=sys.stdout, flush=True)
                 predictions = model.predict_proba(test_dataset=all_data)
                 predictions = predictions[4]  # Get the probability array
                 

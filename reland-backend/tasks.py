@@ -3,6 +3,10 @@ Background tasks for model training using RQ (Redis Queue).
 This module contains long-running tasks that should be executed asynchronously.
 """
 import os
+# Set this BEFORE any other imports to prevent macOS fork() issues
+# This is required on macOS when RQ forks processes to run tasks
+os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+
 import subprocess
 import sys
 import traceback
@@ -100,14 +104,14 @@ def train_model_task(municipio, subset, model_name, objective, n_step, db_url):
                     all_locations = Location.query.all()
                 except Exception as db_error:
                     if 'dist_old_mine' in str(db_error) or 'UndefinedColumn' in str(db_error):
-                        worker_db.session.rollback()
+                        db.session.rollback()
                         query = text("""
                             SELECT id, lat, lon, municipio, risk_score, risk_score_lr, risk_level,
                                    elevation, rainfall, temperature, population_2012, hist_mines,
                                    created_at, updated_at
                             FROM locations
                         """)
-                        result = worker_db.session.execute(query)
+                        result = db.session.execute(query)
                         all_locations = []
                         for row in result:
                             loc = Location()
@@ -128,18 +132,18 @@ def train_model_task(municipio, subset, model_name, objective, n_step, db_url):
                             loc.dist_old_mine = None
                             all_locations.append(loc)
                     else:
-                        worker_db.session.rollback()
+                        db.session.rollback()
                         raise
                 
                 if all_locations:
                     # Check if dist_old_mine column exists
-                    inspector = inspect(worker_db.engine)
+                    inspector = inspect(db.engine)
                     columns = [col['name'] for col in inspector.get_columns('locations')]
                     column_exists = 'dist_old_mine' in columns
                     
                     if not column_exists:
-                        worker_db.session.execute(text("ALTER TABLE locations ADD COLUMN dist_old_mine FLOAT"))
-                        worker_db.session.commit()
+                        db.session.execute(text("ALTER TABLE locations ADD COLUMN dist_old_mine FLOAT"))
+                        db.session.commit()
                         column_exists = True
                     
                     grid_data = {
@@ -164,15 +168,15 @@ def train_model_task(municipio, subset, model_name, objective, n_step, db_url):
                             WHERE id = :location_id
                         """)
                         for i, location in enumerate(all_locations):
-                            worker_db.session.execute(
+                            db.session.execute(
                                 update_query,
                                 {'distance': float(distances[i]), 'location_id': location.id}
                             )
-                        worker_db.session.commit()
+                        db.session.commit()
                     else:
                         for i, location in enumerate(all_locations):
                             location.dist_old_mine = float(distances[i])
-                        worker_db.session.commit()
+                        db.session.commit()
         
         # Update progress
         if job:
@@ -289,7 +293,7 @@ def train_model_task(municipio, subset, model_name, objective, n_step, db_url):
                 with worker_app.app_context():
                     predictions_df = pd.read_csv(predicted_proba_path)
                     from save_predictions_db import save_predictions_to_db_orm
-                    save_predictions_to_db_orm(predictions_df, worker_db.session, Location)
+                    save_predictions_to_db_orm(predictions_df, db.session, Location)
                 predictions_saved = True
         except Exception as e:
             print(f"⚠️  Could not save predictions to database: {str(e)}")

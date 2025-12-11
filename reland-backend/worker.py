@@ -10,8 +10,12 @@ Or with custom Redis URL:
     REDIS_URL=redis://localhost:6379/0 python worker.py
 """
 import os
+# Set this BEFORE any other imports to prevent macOS fork() issues
+# This is required on macOS when using RQ workers that fork processes
+os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+
 from dotenv import load_dotenv
-from rq import Worker, Queue, Connection
+from rq import Worker, Queue
 from redis import Redis
 
 # Load environment variables
@@ -37,8 +41,9 @@ if __name__ == '__main__':
     print("Press Ctrl+C to stop")
     print("="*50 + "\n")
     
-    # Start worker
-    with Connection(redis_conn):
-        worker = Worker([queue])
-        worker.work()
+    # Start worker (RQ 2.x doesn't need Connection context manager)
+    # Note: OBJC_DISABLE_INITIALIZE_FORK_SAFETY is set at the top of the file
+    # to prevent macOS fork() crashes with Objective-C runtime
+    worker = Worker([queue], connection=redis_conn)
+    worker.work()
 

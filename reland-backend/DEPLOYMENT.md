@@ -73,6 +73,11 @@ python backend-app.py
 **Terminal 2 - Worker:**
 ```bash
 cd reland-backend
+# On macOS, use the wrapper script to prevent fork() crashes:
+./start_worker.sh
+
+# Or manually:
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 source venv/bin/activate
 python worker.py
 ```

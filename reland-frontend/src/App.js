@@ -921,76 +921,132 @@ function App() {
     fetchConfirmedEvents();
   }, []);
 
-  // Fix layer ordering: Ensure borders are always rendered after predictions
-  // Use useEffect to reorder layers after both are loaded
+  // CRITICAL: Enforce layer ordering - predictions (BOTTOM) -> borders (MIDDLE) -> confirmed events (TOP)
+  // This ensures order is ALWAYS maintained: Layer 1 (predictions) at bottom, Layer 3 (confirmed events) at top
   useEffect(() => {
     if (!mapRef.current || !mapReady) return;
     
     const map = mapRef.current.getMap();
     if (!map || !map.isStyleLoaded()) return;
     
-    // Wait for both layers to exist
+    // Wait a bit for layers to be added/updated
     const timeoutId = setTimeout(() => {
       try {
         const predictionLayer = map.getLayer('prediction-points');
         const borderFillLayer = map.getLayer('municipality-borders-fill');
         const borderOutlineLayer = map.getLayer('municipality-borders-outline');
+        const confirmedEventsLayer = map.getLayer('confirmed-events');
         
-        if (predictionLayer && (borderFillLayer || borderOutlineLayer)) {
-          // Move border layers to be after prediction layer
-          // moveLayer(id, beforeId) moves id before beforeId
-          // To move after prediction, we need to find what comes after prediction
-          const layers = map.getStyle().layers;
-          const predictionIndex = layers.findIndex(l => l.id === 'prediction-points');
+        const layers = map.getStyle().layers;
+        
+        // Get all layer indices
+        const predictionIndex = predictionLayer ? layers.findIndex(l => l.id === 'prediction-points') : -1;
+        const borderFillIndex = borderFillLayer ? layers.findIndex(l => l.id === 'municipality-borders-fill') : -1;
+        const borderOutlineIndex = borderOutlineLayer ? layers.findIndex(l => l.id === 'municipality-borders-outline') : -1;
+        const confirmedEventsIndex = confirmedEventsLayer ? layers.findIndex(l => l.id === 'confirmed-events') : -1;
+        
+        // STEP 1: Ensure predictions are at the BOTTOM (lowest index)
+        // Move prediction layer to be before all other data layers if it's not first
+        if (predictionLayer && predictionIndex >= 0) {
+          // Find the first data layer (should be predictions)
+          let firstDataLayerIndex = -1;
+          for (let i = 0; i < layers.length; i++) {
+            const layerId = layers[i].id;
+            if (layerId === 'prediction-points' || layerId === 'municipality-borders-fill' || 
+                layerId === 'municipality-borders-outline' || layerId === 'confirmed-events') {
+              firstDataLayerIndex = i;
+              break;
+            }
+          }
           
-          if (predictionIndex >= 0) {
-            // Find the first layer after prediction that's not a border layer
-            let targetBeforeId = null;
+          // If predictions are not first, move them to be first
+          if (firstDataLayerIndex >= 0 && layers[firstDataLayerIndex].id !== 'prediction-points') {
+            map.moveLayer('prediction-points', layers[firstDataLayerIndex].id);
+          }
+        }
+        
+        // STEP 2: Ensure borders come after predictions
+        if (predictionLayer && borderFillLayer && predictionIndex >= 0 && borderFillIndex >= 0) {
+          if (borderFillIndex < predictionIndex) {
+            // Border fill is before predictions, move it after
+            // Find what comes after predictions
             for (let i = predictionIndex + 1; i < layers.length; i++) {
-              const layerId = layers[i].id;
-              if (layerId !== 'municipality-borders-fill' && 
-                  layerId !== 'municipality-borders-outline') {
-                targetBeforeId = layerId;
+              const nextLayerId = layers[i].id;
+              if (nextLayerId !== 'municipality-borders-fill' && nextLayerId !== 'municipality-borders-outline') {
+                map.moveLayer('municipality-borders-fill', nextLayerId);
                 break;
-              }
-            }
-            
-            // Move border fill to be right after prediction
-            if (borderFillLayer) {
-              if (targetBeforeId) {
-                map.moveLayer('municipality-borders-fill', targetBeforeId);
-              }
-            }
-            
-            // Move border outline to be after fill
-            if (borderOutlineLayer) {
-              const fillIndex = layers.findIndex(l => l.id === 'municipality-borders-fill');
-              if (fillIndex >= 0) {
-                // Find what comes after fill
-                let outlineTargetBeforeId = null;
-                for (let i = fillIndex + 1; i < layers.length; i++) {
-                  if (layers[i].id !== 'municipality-borders-outline') {
-                    outlineTargetBeforeId = layers[i].id;
-                    break;
-                  }
-                }
-                if (outlineTargetBeforeId) {
-                  map.moveLayer('municipality-borders-outline', outlineTargetBeforeId);
-                }
-              } else if (targetBeforeId) {
-                // No fill layer, move outline after prediction
-                map.moveLayer('municipality-borders-outline', targetBeforeId);
               }
             }
           }
         }
+        
+        if (borderFillLayer && borderOutlineLayer && borderFillIndex >= 0 && borderOutlineIndex >= 0) {
+          if (borderOutlineIndex < borderFillIndex) {
+            // Border outline is before border fill, move it after
+            for (let i = borderFillIndex + 1; i < layers.length; i++) {
+              const nextLayerId = layers[i].id;
+              if (nextLayerId !== 'municipality-borders-outline') {
+                map.moveLayer('municipality-borders-outline', nextLayerId);
+                break;
+              }
+            }
+          }
+        }
+        
+        // STEP 3: Ensure confirmed events are at the TOP (highest index - rendered last)
+        // Move confirmed-events to be after ALL other data layers
+        if (confirmedEventsLayer && confirmedEventsIndex >= 0) {
+          // Find the last border layer (or prediction if no borders)
+          const lastBorderIndex = borderOutlineIndex >= 0 ? borderOutlineIndex : 
+                                 (borderFillIndex >= 0 ? borderFillIndex : predictionIndex);
+          
+          if (lastBorderIndex >= 0) {
+            // Check if confirmed events are already after the last border
+            if (confirmedEventsIndex <= lastBorderIndex) {
+              // Confirmed events are before or at the same position as borders - move them after
+              // Find the very last layer in the map
+              const lastLayer = layers[layers.length - 1];
+              if (lastLayer && lastLayer.id !== 'confirmed-events') {
+                // Move confirmed events to be after the last layer (which puts them at the very top)
+                // We need to find what comes after the last border, or move to the end
+                let targetBeforeId = null;
+                
+                // Find the first layer after the last border that's not confirmed-events
+                for (let i = lastBorderIndex + 1; i < layers.length; i++) {
+                  if (layers[i].id !== 'confirmed-events') {
+                    targetBeforeId = layers[i].id;
+                    break;
+                  }
+                }
+                
+                if (targetBeforeId) {
+                  map.moveLayer('confirmed-events', targetBeforeId);
+                } else {
+                  // No layer after borders, confirmed events should be last
+                  // Move it after the last layer
+                  map.moveLayer('confirmed-events', lastLayer.id);
+                }
+              }
+            }
+          } else if (predictionIndex >= 0 && confirmedEventsIndex <= predictionIndex) {
+            // No borders, but confirmed events are before predictions - move after predictions
+            for (let i = predictionIndex + 1; i < layers.length; i++) {
+              if (layers[i].id !== 'confirmed-events') {
+                map.moveLayer('confirmed-events', layers[i].id);
+                break;
+              }
+            }
+          }
+        }
+        
       } catch (err) {
-        // Silently fail - layers might already be in correct order
+        // Silently fail - layers might not exist yet or already be in correct order
+        console.debug('Layer reordering:', err);
       }
-    }, 300); // Delay to ensure layers are added
+    }, 150); // Small delay to ensure layers are added
     
     return () => clearTimeout(timeoutId);
-  }, [predictionData, municipalityBorders, mapReady, mapStyle]);
+  }, [showPrediction, showConfirmedEvents, predictionData, municipalityBorders, confirmedEvents, mapReady, mapStyle]);
 
   // Function to load custom icons - reusable for map load and style changes
   const loadCustomIcons = useCallback(() => {
@@ -1179,6 +1235,200 @@ function App() {
             onChange={e => setShowPrediction(e.target.checked)}
           />
           <label htmlFor="show-prediction">Show RELand Risk Prediction</label>
+          
+          {/* Color Map Legend - positioned below the checkbox */}
+          {showPrediction && (
+            <div style={{
+              marginTop: '12px',
+              background: 'linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(248,249,250,0.98) 100%)',
+              padding: showLegend ? '15px' : '0',
+              borderRadius: '8px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+              fontSize: '12px',
+              transition: 'all 0.3s ease',
+              overflow: 'hidden'
+            }}>
+              {/* Header with Toggle */}
+              <div style={{ 
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: showLegend ? '12px' : '0',
+                paddingBottom: showLegend ? '10px' : '0',
+                borderBottom: showLegend ? '1px solid #e9ecef' : 'none',
+                transition: 'all 0.3s ease'
+              }}>
+                <div style={{ 
+                  fontWeight: '600', 
+                  fontSize: '13px',
+                  color: '#212529',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px'
+                }}>
+                  {showLegend && <span>🎨</span>}
+                  {showLegend && <span>Color Map</span>}
+                </div>
+                <button
+                  onClick={() => setShowLegend(!showLegend)}
+                  style={{
+                    background: showLegend ? '#6c757d' : '#007bff',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    padding: '4px 10px',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    fontWeight: '600',
+                    transition: 'all 0.2s ease'
+                  }}
+                >
+                  {showLegend ? '−' : '+'}
+                </button>
+              </div>
+              
+              {showLegend && (
+                <div style={{ animation: 'fadeIn 0.3s ease' }}>
+                  {/* Risk Prediction Legend with Gradient */}
+                  <div style={{ 
+                    marginBottom: '12px',
+                    padding: '10px',
+                    background: 'linear-gradient(135deg, rgba(0,123,255,0.05) 0%, rgba(0,123,255,0.02) 100%)',
+                    borderRadius: '6px',
+                    border: '1px solid rgba(0,123,255,0.1)'
+                  }}>
+                    <div style={{ 
+                      fontWeight: '600', 
+                      marginBottom: '8px', 
+                      color: '#007bff',
+                      fontSize: '12px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '5px'
+                    }}>
+                      <span>📍</span>
+                      <span>Risk Prediction</span>
+                    </div>
+                    
+                    {/* Gradient Bar */}
+                    <div style={{
+                      height: '20px',
+                      background: 'linear-gradient(to right, rgb(28,238,238) 0%, yellow 50%, red 100%)',
+                      borderRadius: '4px',
+                      marginBottom: '8px',
+                      boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.1)',
+                      border: '1px solid rgba(0,0,0,0.1)',
+                      position: 'relative',
+                      overflow: 'hidden'
+                    }}>
+                      <div style={{
+                        position: 'absolute',
+                        left: '33%',
+                        top: 0,
+                        bottom: 0,
+                        width: '1px',
+                        background: 'rgba(255,255,255,0.8)',
+                        boxShadow: '0 0 1px rgba(0,0,0,0.3)'
+                      }}></div>
+                      <div style={{
+                        position: 'absolute',
+                        left: '67%',
+                        top: 0,
+                        bottom: 0,
+                        width: '1px',
+                        background: 'rgba(255,255,255,0.8)',
+                        boxShadow: '0 0 1px rgba(0,0,0,0.3)'
+                      }}></div>
+                    </div>
+                    
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#6c757d', marginBottom: '6px' }}>
+                      <span>Low</span>
+                      <span>Medium</span>
+                      <span>High</span>
+                    </div>
+                    
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '4px', marginTop: '6px' }}>
+                      <div style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        padding: '4px',
+                        background: 'rgba(28,238,238,0.1)',
+                        borderRadius: '4px'
+                      }}>
+                        <div style={{
+                          width: '16px',
+                          height: '16px',
+                          backgroundColor: 'rgb(28,238,238)',
+                          border: '2px solid white',
+                          borderRadius: '3px',
+                          marginBottom: '3px',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '10px', fontWeight: '600', color: '#495057' }}>Low</span>
+                      </div>
+                      <div style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        padding: '4px',
+                        background: 'rgba(255,255,0,0.1)',
+                        borderRadius: '4px'
+                      }}>
+                        <div style={{
+                          width: '16px',
+                          height: '16px',
+                          backgroundColor: 'yellow',
+                          border: '2px solid white',
+                          borderRadius: '3px',
+                          marginBottom: '3px',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '10px', fontWeight: '600', color: '#495057' }}>Medium</span>
+                      </div>
+                      <div style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        padding: '4px',
+                        background: 'rgba(255,0,0,0.1)',
+                        borderRadius: '4px'
+                      }}>
+                        <div style={{
+                          width: '16px',
+                          height: '16px',
+                          backgroundColor: 'red',
+                          border: '2px solid white',
+                          borderRadius: '3px',
+                          marginBottom: '3px',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+                        }}></div>
+                        <span style={{ fontSize: '10px', fontWeight: '600', color: '#495057' }}>High</span>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  {/* Data count info */}
+                  {predictionData && (
+                    <div style={{ 
+                      marginTop: '8px', 
+                      paddingTop: '8px', 
+                      borderTop: '1px solid #e9ecef',
+                      fontSize: '10px',
+                      color: '#6c757d',
+                      textAlign: 'center',
+                      fontWeight: '500',
+                      background: 'rgba(0,123,255,0.05)',
+                      padding: '6px',
+                      borderRadius: '4px'
+                    }}>
+                      📍 Showing <strong>{predictionData.features.length.toLocaleString()}</strong> prediction points
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="control-group">
@@ -1190,6 +1440,27 @@ function App() {
             onChange={e => setShowConfirmedEvents(e.target.checked)}
           />
           <label htmlFor="show-confirmed-events">Show Confirmed Events on Map</label>
+          <div style={{ 
+            marginTop: '8px', 
+            padding: '8px', 
+            backgroundColor: '#f8f9fa', 
+            borderRadius: '4px', 
+            fontSize: '12px',
+            color: '#495057',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px'
+          }}>
+            <svg width="16" height="16" style={{ flexShrink: 0 }}>
+              <polygon 
+                points="8,2 14,14 2,14" 
+                fill="#ff0000" 
+                stroke="white" 
+                strokeWidth="1"
+              />
+            </svg>
+            <span>Red triangle icons represent confirmed mine events</span>
+          </div>
         </div>
 
         <div className="control-group">
@@ -1471,10 +1742,17 @@ function App() {
           <NavigationControl position="top-right" />
           
           {/* --- Map Data Layers --- */}
-          {/* We only render the Source and Layer if the data exists */}
+          {/* CRITICAL: Layer order is ALWAYS maintained by rendering in this exact order:
+              1. Prediction points (BOTTOM - rendered first)
+              2. Municipality borders (MIDDLE - rendered second)  
+              3. Confirmed events (TOP - rendered last)
+              
+              All layers are ALWAYS rendered (not conditionally) to maintain order.
+              Visibility is controlled via layout.visibility instead of conditional rendering.
+              This ensures order is preserved even when toggling checkboxes. */}
           
-          {/* 1. Prediction Layer - Square Points */}
-          {showPrediction && predictionData && (
+          {/* 1. Prediction Layer - Square Points (BOTTOM LAYER - Always rendered first) */}
+          {predictionData && (
             <Source 
               key={`prediction-${mapStyle}`}
               type="geojson" 
@@ -1490,15 +1768,10 @@ function App() {
                     ['<', ['get', 'sonson_avg_normalized'], 0.67], 'square-medium',
                     'square-high'
                   ],
-                  'icon-size': [
-                    'interpolate',
-                    ['linear'],
-                    ['get', 'sonson_avg_normalized'],
-                    0, 0.4,
-                    1, 1.0
-                  ],
+                  'icon-size': 0.6, // Fixed size for all prediction points
                   'icon-allow-overlap': true,
-                  'icon-ignore-placement': true
+                  'icon-ignore-placement': true,
+                  'visibility': showPrediction ? 'visible' : 'none' // Control visibility, don't remove layer
                 }}
                 paint={{
                   'icon-opacity': 0.8
@@ -1507,335 +1780,6 @@ function App() {
             </Source>
           )}
           
-          {/* Enhanced Color Map Legend */}
-          <div style={{
-            position: 'absolute',
-            bottom: 10,
-            left: 10,
-            background: 'linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(248,249,250,0.98) 100%)',
-            padding: showLegend ? '20px' : '0',
-            borderRadius: '12px',
-            boxShadow: '0 4px 20px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05)',
-            fontSize: '13px',
-            zIndex: 1000,
-            minWidth: showLegend ? '280px' : '50px',
-            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
-            transition: 'all 0.3s ease',
-            backdropFilter: 'blur(10px)',
-            overflow: 'hidden'
-          }}>
-            {/* Header with Toggle */}
-            <div style={{ 
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              marginBottom: showLegend ? '15px' : '0',
-              paddingBottom: showLegend ? '12px' : '0',
-              borderBottom: showLegend ? '2px solid #e9ecef' : 'none',
-              transition: 'all 0.3s ease'
-            }}>
-              <div style={{ 
-                fontWeight: '700', 
-                fontSize: '16px',
-                color: '#212529',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px'
-              }}>
-                {showLegend && <span>🎨</span>}
-                {showLegend && <span>Color Map</span>}
-              </div>
-              <button
-                onClick={() => setShowLegend(!showLegend)}
-                style={{
-                  background: showLegend ? '#6c757d' : '#007bff',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '6px',
-                  padding: '6px 12px',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                  fontWeight: '600',
-                  transition: 'all 0.2s ease',
-                  boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-                }}
-                onMouseOver={(e) => e.target.style.transform = 'scale(1.05)'}
-                onMouseOut={(e) => e.target.style.transform = 'scale(1)'}
-              >
-                {showLegend ? '−' : '⚡'}
-              </button>
-            </div>
-            
-            {showLegend && (
-              <div style={{ animation: 'fadeIn 0.3s ease' }}>
-                {/* Risk Prediction Legend with Gradient */}
-                {showPrediction && (
-                  <div style={{ 
-                    marginBottom: '18px',
-                    padding: '12px',
-                    background: 'linear-gradient(135deg, rgba(0,123,255,0.05) 0%, rgba(0,123,255,0.02) 100%)',
-                    borderRadius: '8px',
-                    border: '1px solid rgba(0,123,255,0.1)'
-                  }}>
-                    <div style={{ 
-                      fontWeight: '700', 
-                      marginBottom: '10px', 
-                      color: '#007bff',
-                      fontSize: '14px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px'
-                    }}>
-                      <span>📍</span>
-                      <span>Risk Prediction</span>
-                    </div>
-                    
-                    {/* Gradient Bar */}
-                    <div style={{
-                      height: '24px',
-                      background: 'linear-gradient(to right, rgb(28,238,238) 0%, yellow 50%, red 100%)',
-                      borderRadius: '6px',
-                      marginBottom: '10px',
-                      boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.1)',
-                      border: '1px solid rgba(0,0,0,0.1)',
-                      position: 'relative',
-                      overflow: 'hidden'
-                    }}>
-                      <div style={{
-                        position: 'absolute',
-                        left: '33%',
-                        top: 0,
-                        bottom: 0,
-                        width: '1px',
-                        background: 'rgba(255,255,255,0.8)',
-                        boxShadow: '0 0 2px rgba(0,0,0,0.3)'
-                      }}></div>
-                      <div style={{
-                        position: 'absolute',
-                        left: '67%',
-                        top: 0,
-                        bottom: 0,
-                        width: '1px',
-                        background: 'rgba(255,255,255,0.8)',
-                        boxShadow: '0 0 2px rgba(0,0,0,0.3)'
-                      }}></div>
-                    </div>
-                    
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#6c757d', marginBottom: '8px' }}>
-                      <span>Low</span>
-                      <span>Medium</span>
-                      <span>High</span>
-                    </div>
-                    
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px', marginTop: '8px' }}>
-                      <div style={{ 
-                        display: 'flex', 
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        padding: '6px',
-                        background: 'rgba(28,238,238,0.1)',
-                        borderRadius: '6px'
-                      }}>
-                        <div style={{
-                          width: '20px',
-                          height: '20px',
-                          backgroundColor: 'rgb(28,238,238)',
-                          border: '2px solid white',
-                          borderRadius: '4px',
-                          marginBottom: '4px',
-                          boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
-                        }}></div>
-                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#495057' }}>Low</span>
-                      </div>
-                      <div style={{ 
-                        display: 'flex', 
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        padding: '6px',
-                        background: 'rgba(255,255,0,0.1)',
-                        borderRadius: '6px'
-                      }}>
-                        <div style={{
-                          width: '20px',
-                          height: '20px',
-                          backgroundColor: 'yellow',
-                          border: '2px solid white',
-                          borderRadius: '4px',
-                          marginBottom: '4px',
-                          boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
-                        }}></div>
-                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#495057' }}>Medium</span>
-                      </div>
-                      <div style={{ 
-                        display: 'flex', 
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        padding: '6px',
-                        background: 'rgba(255,0,0,0.1)',
-                        borderRadius: '6px'
-                      }}>
-                        <div style={{
-                          width: '20px',
-                          height: '20px',
-                          backgroundColor: 'red',
-                          border: '2px solid white',
-                          borderRadius: '4px',
-                          marginBottom: '4px',
-                          boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
-                        }}></div>
-                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#495057' }}>High</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                
-                {/* Confirmed Events Legend */}
-                {showConfirmedEvents && (
-                  <div style={{ 
-                    marginBottom: '18px',
-                    padding: '12px',
-                    background: 'linear-gradient(135deg, rgba(220,53,69,0.05) 0%, rgba(220,53,69,0.02) 100%)',
-                    borderRadius: '8px',
-                    border: '1px solid rgba(220,53,69,0.1)'
-                  }}>
-                    <div style={{ 
-                      fontWeight: '700', 
-                      marginBottom: '10px', 
-                      color: '#dc3545',
-                      fontSize: '14px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px'
-                    }}>
-                      <span>⚠️</span>
-                      <span>Confirmed Events</span>
-                    </div>
-                    <div style={{ 
-                      display: 'flex', 
-                      alignItems: 'center',
-                      padding: '8px',
-                      background: 'rgba(255,255,255,0.5)',
-                      borderRadius: '6px'
-                    }}>
-                      <svg width="20" height="20" style={{ marginRight: '10px', filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.2))' }}>
-                        <polygon 
-                          points="10,3 17,17 3,17" 
-                          fill="#ff0000" 
-                          stroke="white" 
-                          strokeWidth="2"
-                        />
-                      </svg>
-                      <span style={{ fontWeight: '600', color: '#495057' }}>Confirmed Mine Event</span>
-                    </div>
-                  </div>
-                )}
-                
-                {/* Historical Events Legend */}
-                {showHistorical.length > 0 && (
-                  <div style={{ 
-                    marginBottom: '18px',
-                    padding: '12px',
-                    background: 'linear-gradient(135deg, rgba(108,117,125,0.05) 0%, rgba(108,117,125,0.02) 100%)',
-                    borderRadius: '8px',
-                    border: '1px solid rgba(108,117,125,0.1)'
-                  }}>
-                    <div style={{ 
-                      fontWeight: '700', 
-                      marginBottom: '10px', 
-                      color: '#6c757d',
-                      fontSize: '14px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px'
-                    }}>
-                      <span>📊</span>
-                      <span>Historical Events</span>
-                    </div>
-                    {showHistorical.includes(-1) && (
-                      <div style={{ 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        marginBottom: '6px',
-                        padding: '6px',
-                        background: 'rgba(255,255,255,0.5)',
-                        borderRadius: '6px'
-                      }}>
-                        <div style={{
-                          width: '14px',
-                          height: '14px',
-                          borderRadius: '50%',
-                          backgroundColor: '#808080',
-                          marginRight: '10px',
-                          border: '2px solid white',
-                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
-                        }}></div>
-                        <span style={{ fontSize: '12px', color: '#495057' }}>No Historical Data</span>
-                      </div>
-                    )}
-                    {showHistorical.includes(0) && (
-                      <div style={{ 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        marginBottom: '6px',
-                        padding: '6px',
-                        background: 'rgba(255,255,255,0.5)',
-                        borderRadius: '6px'
-                      }}>
-                        <div style={{
-                          width: '14px',
-                          height: '14px',
-                          borderRadius: '50%',
-                          backgroundColor: '#28a745',
-                          marginRight: '10px',
-                          border: '2px solid white',
-                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
-                        }}></div>
-                        <span style={{ fontSize: '12px', color: '#495057' }}>Mine-Free Area</span>
-                      </div>
-                    )}
-                    {showHistorical.includes(1) && (
-                      <div style={{ 
-                        display: 'flex', 
-                        alignItems: 'center',
-                        padding: '6px',
-                        background: 'rgba(255,255,255,0.5)',
-                        borderRadius: '6px'
-                      }}>
-                        <div style={{
-                          width: '14px',
-                          height: '14px',
-                          borderRadius: '50%',
-                          backgroundColor: '#dc3545',
-                          marginRight: '10px',
-                          border: '2px solid white',
-                          boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
-                        }}></div>
-                        <span style={{ fontSize: '12px', color: '#495057' }}>Affected by Landmines</span>
-                      </div>
-                    )}
-                  </div>
-                )}
-                
-                {/* Data count info */}
-                {showPrediction && predictionData && (
-                  <div style={{ 
-                    marginTop: '12px', 
-                    paddingTop: '12px', 
-                    borderTop: '2px solid #e9ecef',
-                    fontSize: '11px',
-                    color: '#6c757d',
-                    textAlign: 'center',
-                    fontWeight: '500',
-                    background: 'rgba(0,123,255,0.05)',
-                    padding: '8px',
-                    borderRadius: '6px'
-                  }}>
-                    📍 Showing <strong>{predictionData.features.length.toLocaleString()}</strong> prediction points
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
 
           {/* 2. Historical Layer - commented out for now */}
           {/* {historicalData && (
@@ -1848,9 +1792,8 @@ function App() {
             </Source>
           )} */}
 
-          {/* 2.5. Municipality Borders Layer - Render AFTER predictions so borders appear on top */}
-          {/* Only render borders when predictions are ready to ensure correct layer ordering */}
-          {municipalityBorders && predictionData && (
+          {/* 2. Municipality Borders Layer (MIDDLE LAYER - Always rendered second) */}
+          {municipalityBorders && (
             <Source 
               key={`borders-${mapStyle}`}
               type="geojson" 
@@ -1876,8 +1819,8 @@ function App() {
             </Source>
           )}
 
-          {/* 3. Confirmed Events Layer - Only show if checkbox is checked */}
-          {showConfirmedEvents && confirmedEvents.length > 0 && (
+          {/* 3. Confirmed Events Layer (TOP LAYER - Always rendered last) */}
+          {confirmedEvents.length > 0 && (
             <Source 
               key={`events-${mapStyle}`}
               type="geojson" 
@@ -1894,9 +1837,10 @@ function App() {
                 type="symbol"
                 layout={{
                   'icon-image': 'triangle-marker',
-                  'icon-size': 1.0,
+                  'icon-size': 0.75, // Reduced triangle size
                   'icon-allow-overlap': true,
-                  'icon-ignore-placement': true
+                  'icon-ignore-placement': true,
+                  'visibility': showConfirmedEvents ? 'visible' : 'none' // Control visibility, don't remove layer
                 }}
                 paint={{
                   'icon-opacity': editMode === 'events' ? 1.0 : 0.8
