@@ -128,3 +128,63 @@ class ConfirmedEvent(db.Model):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
+
+class TrainingJob(db.Model):
+    """Model for tracking training jobs in the database (replaces Redis queue)"""
+    __tablename__ = 'training_jobs'
+    
+    id = db.Column(db.String, primary_key=True)  # UUID or timestamp-based ID
+    job_type = db.Column(db.String, nullable=False)  # 'retrain' or 'repredict'
+    status = db.Column(db.String, default='pending', nullable=False)  # 'pending', 'running', 'completed', 'failed'
+    
+    # Job parameters
+    municipio = db.Column(db.String, nullable=True)
+    subset = db.Column(db.String, nullable=True)
+    model_name = db.Column(db.String, nullable=True)
+    objective = db.Column(db.String, nullable=True)
+    n_step = db.Column(db.Integer, nullable=True)
+    
+    # Progress tracking
+    progress = db.Column(db.Float, default=0.0)  # 0.0 to 1.0
+    progress_message = db.Column(db.Text, nullable=True)
+    
+    # Results
+    result = db.Column(db.Text, nullable=True)  # JSON string with results
+    error_message = db.Column(db.Text, nullable=True)
+    
+    # EC2 instance tracking
+    ec2_instance_id = db.Column(db.String, nullable=True)
+    
+    # Timestamps
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    started_at = db.Column(db.DateTime, nullable=True)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    
+    def to_dict(self):
+        """Convert to dictionary for JSON serialization"""
+        # Parse result if it's a JSON string
+        result_data = None
+        if self.result:
+            try:
+                import json
+                result_data = json.loads(self.result)
+            except:
+                result_data = self.result
+        
+        return {
+            'id': self.id,
+            'job_type': self.job_type,
+            'status': self.status,
+            'progress': self.progress,
+            'progress_message': self.progress_message,
+            'result': result_data,  # Parsed JSON instead of raw string
+            'error_message': self.error_message,
+            'ec2_instance_id': self.ec2_instance_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None
+        }
+    
+    def __repr__(self):
+        return f"<TrainingJob(id={self.id}, type={self.job_type}, status={self.status})>"
+

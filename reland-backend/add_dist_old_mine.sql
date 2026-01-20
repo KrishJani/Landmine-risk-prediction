@@ -11,3 +11,10 @@ WHERE table_name = 'locations' AND column_name = 'dist_old_mine';
 
 
 
+
+
+
+
+
+
+

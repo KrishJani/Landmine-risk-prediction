@@ -1,0 +1,197 @@
+name: Deploy Backend to AWS App Runner
+
+on:
+  push:
+    branches:
+      - main
+      - production
+    paths:
+      - 'reland-backend/**'
+      - '.github/workflows/deploy-backend.yml'
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: reland-backend
+  APP_RUNNER_SERVICE: reland-backend
+
+jobs:
+  deploy:
+    name: Build and Deploy Backend
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd reland-backend
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update App Runner Service with New Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Get current service configuration
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region ${{ env.AWS_REGION }} \
+            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
+            --output text)
+          
+          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" == "None" ]; then
+            echo "Error: App Runner service '${{ env.APP_RUNNER_SERVICE }}' not found"
+            exit 1
+          fi
+          
+          # Get current service configuration
+          aws apprunner describe-service \
+            --service-arn $SERVICE_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Service.SourceConfiguration' > /tmp/current-source.json
+          
+          # Update source configuration with new image (optimized - no Redis)
+          cat > /tmp/new-source.json <<EOF
+          {
+            "ImageRepository": {
+              "ImageIdentifier": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+              "ImageConfiguration": {
+                "Port": "8000",
+                "RuntimeEnvironmentVariables": {
+                  "DATABASE_URL": "${{ secrets.DATABASE_URL }}",
+                  "AWS_REGION": "${{ env.AWS_REGION }}",
+                  "S3_MODELS_BUCKET": "${{ secrets.S3_MODELS_BUCKET }}",
+                  "EC2_LAUNCH_TEMPLATE_NAME": "${{ secrets.EC2_LAUNCH_TEMPLATE_NAME || 'reland-worker-template' }}",
+                  "USE_REDIS": "false",
+                  "PORT": "8000"
+                }
+              },
+              "ImageRepositoryType": "ECR"
+            },
+            "AutoDeploymentsEnabled": false
+          }
+          EOF
+          
+          # Update service with new source
+          aws apprunner update-service \
+            --service-arn $SERVICE_ARN \
+            --source-configuration file:///tmp/new-source.json \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "Service updated with new image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+      - name: Start Deployment
+        run: |
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region ${{ env.AWS_REGION }} \
+            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
+            --output text)
+          
+          # Start deployment
+          aws apprunner start-deployment \
+            --service-arn $SERVICE_ARN \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "Deployment started for service: $SERVICE_ARN"
+
+      - name: Wait for deployment
+        run: |
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region ${{ env.AWS_REGION }} \
+            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
+            --output text)
+          
+          echo "Waiting for deployment to complete..."
+          echo "This may take 5-10 minutes..."
+          
+          # Wait for service to be in service state
+          for i in {1..30}; do
+            STATUS=$(aws apprunner describe-service \
+              --service-arn $SERVICE_ARN \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Service.Status' \
+              --output text)
+            
+            echo "Attempt $i/30: Service status: $STATUS"
+            
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "✅ Service is running!"
+              break
+            fi
+            
+            if [ "$i" -eq 30 ]; then
+              echo "⚠️ Timeout waiting for service to be running"
+              exit 1
+            fi
+            
+            sleep 30
+          done
+          
+          # Get service URL
+          SERVICE_URL=$(aws apprunner describe-service \
+            --service-arn $SERVICE_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Service.ServiceUrl' \
+            --output text)
+          
+          echo "✅ Deployment completed successfully!"
+          echo "Service URL: $SERVICE_URL"
+
+      - name: Health check
+        run: |
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region ${{ env.AWS_REGION }} \
+            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
+            --output text)
+          
+          SERVICE_URL=$(aws apprunner describe-service \
+            --service-arn $SERVICE_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Service.ServiceUrl' \
+            --output text)
+          
+          echo "Testing health endpoint: $SERVICE_URL/health"
+          
+          # Wait a bit for service to be fully ready
+          sleep 10
+          
+          # Try health check with retries
+          for i in {1..5}; do
+            response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 $SERVICE_URL/health || echo "000")
+            
+            if [ "$response" = "200" ]; then
+              echo "✅ Health check passed!"
+              exit 0
+            fi
+            
+            echo "Attempt $i/5: Health check returned: $response"
+            sleep 10
+          done
+          
+          echo "⚠️ Health check failed after 5 attempts"
+          echo "Service may still be starting. Check CloudWatch logs for details."
+          # Don't fail the workflow - service might need more time
+

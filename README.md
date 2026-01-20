@@ -1,50 +1,39 @@
-# RELand: Risk Estimation of Landmines via Interpretable Invariant Risk Minimization
+# RELand - Landmine Risk Prediction System
 
-### Mateo Dulce Rubio*, Siqi Zeng*, Qi Wang, Didier Alvarado, Francisco Moreno, Hoda Heidari, and Fei Fang
+A machine learning system for predicting landmine risk in Colombia using geospatial data and historical events.
 
-This repository contains all the instructions to replicate the results of the paper ["RELand: Risk Estimation of Landmines via Interpretable Invariant Risk Minimization"](https://dl.acm.org/doi/pdf/10.1145/3648437)
+## 🚀 Production Deployment
 
-# Requirements
+**For production deployment to AWS:**
 
-Required packages:
-```
-pandas
-numpy
-sklearn
-pytorch
-lightgbm
-pytorch_tabnet
-```
+👉 **[DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md)** - Complete step-by-step deployment guide
 
-# Dataset
+**Cost Target:** ~$38.95/month (optimized, no Redis)
 
-The dataset used for experiments in paper is in `/processed_dataset` folder.
+## 🏗️ Architecture
 
-# Validation
+- **Frontend:** React app on S3 + CloudFront
+- **Backend:** Flask API on AWS App Runner
+- **Database:** PostgreSQL with PostGIS on RDS
+- **Training:** EC2 Spot instances (g4dn.xlarge GPU)
+- **Storage:** S3 for models and static files
 
-We provide three validation methods in our paper in `/train_val_stream` folder. 
-- `blockCV`: blockCV method
-- `bolivar`: blockV method
-- `transfer`: transferCV method
+## 💰 Cost Breakdown
 
-# Running Experiments
-We provide an example in `bash run_reland.sh`. Some configurations include:
-- `--timestamp` an unique experiment string
-- `--municipio` use which validation method, either `blockCV`, `bolivar` or ``
-- `--subset` use which subset of features, single (distance to historical landine), geo (geospatial features) or full (all 70 features)
-- `--model` which model to use, `TabCmpt` is the RELand model, other options can be `MLP`, `TabNet`, `LR`, `RF`, `SVM`, `LGBM`
-- `--objective` using irm, erm, or pnorm
-- `--n_step` number of decision blocks
-- `--warm_start` directory with checkpoints
+| Component | Cost/Month |
+|-----------|-----------|
+| Frontend (S3 + CloudFront) | $0.50 |
+| Backend (App Runner) | $15.00 |
+| Database (RDS) | $17.00 |
+| Model Training (EC2 Spot) | $5.20 |
+| Model Storage (S3) | $1.15 |
+| Artifacts (ECR) | $0.10 |
+| **TOTAL** | **~$38.95** |
 
-Your final result for this run will be stored under `/experiments/<timestamp>` that contains
-- all current `.py` files in the root directory
-- a `<municipality>.pth` model for each municipality
-- an `<municipality>.png` image for each municipality that visualizes the ground truth and prediction
-- `config.json` with current configuration (hyper)parameters
-- `metrics.json` that contains all 4 metrics
-- `predicted_proba.csv` that combines validation prediction for all municipalities
-- `feature_importance.csv` with global feature importance if applicable. Black-box models generate -1 values for all features.
+## 🔧 Local Development
 
-# Acknowledgment
-We borrow and edit packages including [ood-bench](https://github.com/m-Just/OoD-Bench), [scikit-learn/tree](https://github.com/scikit-learn/scikit-learn/tree/9aaed498795f68e5956ea762fef9c440ca9eb239/sklearn/tree), [pytorch-tabnet](https://github.com/dreamquark-ai/tabnet).
+See [reland-backend/README.md](./reland-backend/README.md) for local setup.
+
+## 📝 License
+
+See [LICENSE](./LICENSE) file.

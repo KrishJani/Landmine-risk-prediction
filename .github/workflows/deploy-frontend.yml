@@ -1,0 +1,103 @@
+name: Deploy Frontend to S3 and CloudFront
+
+on:
+  push:
+    branches:
+      - main
+      - production
+    paths:
+      - 'reland-frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: reland-web  # Will be appended with account ID
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+jobs:
+  deploy:
+    name: Build and Deploy Frontend
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        id: get-account-id
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "S3_BUCKET_FULL=${S3_BUCKET}-${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: reland-frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: reland-frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: reland-frontend
+        env:
+          REACT_APP_API_URL: ${{ secrets.REACT_APP_API_URL }}
+          REACT_APP_MAPBOX_TOKEN: ${{ secrets.REACT_APP_MAPBOX_TOKEN }}
+        run: npm run build
+
+      - name: Upload to S3
+        run: |
+          # Upload all files except index.html with long cache
+          aws s3 sync reland-frontend/build/ s3://${{ steps.get-account-id.outputs.S3_BUCKET_FULL }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "service-worker.js" \
+            --region ${{ env.AWS_REGION }}
+          
+          # Upload index.html with no cache
+          aws s3 cp reland-frontend/build/index.html s3://${{ steps.get-account-id.outputs.S3_BUCKET_FULL }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ Files uploaded to S3"
+
+      - name: Invalidate CloudFront cache
+        if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          if [ -n "${{ env.CLOUDFRONT_DISTRIBUTION_ID }}" ]; then
+            INVALIDATION_ID=$(aws cloudfront create-invalidation \
+              --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+              --paths "/*" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Invalidation.Id' \
+              --output text)
+            
+            echo "CloudFront invalidation created: $INVALIDATION_ID"
+            echo "This may take 5-15 minutes to complete"
+          else
+            echo "⚠️ CloudFront distribution ID not set, skipping cache invalidation"
+          fi
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Frontend deployment completed!"
+          echo "S3 Bucket: ${{ steps.get-account-id.outputs.S3_BUCKET_FULL }}"
+          if [ -n "${{ env.CLOUDFRONT_DISTRIBUTION_ID }}" ]; then
+            echo "CloudFront Distribution: ${{ env.CLOUDFRONT_DISTRIBUTION_ID }}"
+          fi
+

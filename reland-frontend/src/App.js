@@ -101,6 +101,7 @@ function App() {
   const [historicalData, setHistoricalData] = useState(null);
   const [clusterData, setClusterData] = useState(null);
   const [municipalityBorders, setMunicipalityBorders] = useState(null);
+  const [allMunicipalityBorders, setAllMunicipalityBorders] = useState(null); // Full GeoJSON loaded once
 
   // Search state
   const [searchText, setSearchText] = useState('');
@@ -150,7 +151,73 @@ function App() {
   
   // --- Data Fetching (Side Effects) ---
   
-  // 1. Fetch the list of areas for the dropdown ONCE when the app loads
+  // Helper function to normalize municipality names (similar to backend logic)
+  const normalizeMunicipalityName = (name, removeSuffixes = false) => {
+    if (!name) return "";
+    let normalized = name.toLowerCase().trim();
+    
+    // Remove accents/diacritics
+    normalized = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    
+    if (removeSuffixes) {
+      normalized = normalized.replace(' de indias', '').replace(' del chaira', '');
+      normalized = normalized.replace(' de ', ' ').replace(' del ', ' ');
+    }
+    
+    return normalized;
+  };
+
+  // Helper function to match municipality name
+  const matchMunicipality = (featureName, searchName) => {
+    const featureNorm = normalizeMunicipalityName(featureName, false);
+    const searchNorm = normalizeMunicipalityName(searchName, false);
+    
+    // Exact match
+    if (featureNorm === searchNorm) return true;
+    
+    // Try with suffix removal
+    const featureNormSuffix = normalizeMunicipalityName(featureName, true);
+    const searchNormSuffix = normalizeMunicipalityName(searchName, true);
+    if (featureNormSuffix === searchNormSuffix) return true;
+    
+    // Partial match (starts with)
+    const baseName = searchNormSuffix.split()[0] || searchNormSuffix;
+    if (featureNormSuffix.startsWith(baseName) && baseName.length >= 4) return true;
+    
+    // Contains match
+    if (featureNormSuffix.includes(baseName) && baseName.length >= 4) return true;
+    
+    return false;
+  };
+
+  // 1. Load municipality borders GeoJSON ONCE when the app loads
+  useEffect(() => {
+    // Load GeoJSON from public folder (served as static asset)
+    fetch('/municipality_borders.geojson')
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        console.log("Municipality borders GeoJSON loaded:", data);
+        if (data.type === 'FeatureCollection' && data.features) {
+          setAllMunicipalityBorders(data);
+          console.log(`Loaded ${data.features.length} municipality borders from static file`);
+        } else {
+          console.warn("Invalid GeoJSON format");
+          setAllMunicipalityBorders(null);
+        }
+      })
+      .catch(err => {
+        console.error("Error loading municipality borders GeoJSON:", err);
+        // Don't show alert - it's not critical, backend endpoint can be fallback
+        setAllMunicipalityBorders(null);
+      });
+  }, []);
+
+  // 2. Fetch the list of areas for the dropdown ONCE when the app loads
   useEffect(() => {
     // This 'useEffect' with an empty array [] runs only once.
     fetch(`${API_BASE_URL}/api/initial_data`)
@@ -329,46 +396,36 @@ function App() {
         alert("Error fetching map data from backend.");
       });
     
-    // Fetch municipality borders - always fetch (for selected areas or all if none selected)
-    const borderParams = new URLSearchParams();
-    if (selectedAreas.length > 0) {
-      // Send names as-is (backend will handle normalization)
-      selectedAreas.forEach(area => {
-        if (area && area.toLowerCase() !== 'unknown') {
-          borderParams.append('municipalities[]', area);
-        }
-      });
-    }
-    // If no areas selected or no valid areas, fetch all borders (no params = all borders)
-    
-    const borderUrl = borderParams.toString() 
-      ? `${API_BASE_URL}/api/municipality_borders?${borderParams.toString()}`
-      : `${API_BASE_URL}/api/municipality_borders`;
-    
-    fetch(borderUrl)
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP error! status: ${res.status}`);
-        }
-        return res.json();
-      })
-      .then(data => {
-        console.log("Municipality borders received:", data);
-        if (data.type === 'FeatureCollection' && data.features && data.features.length > 0) {
-          setMunicipalityBorders(data);
-          console.log(`Loaded ${data.features.length} municipality borders`);
-        } else {
-          console.warn("No municipality borders found");
-          setMunicipalityBorders(null);
-        }
-      })
-      .catch(err => {
-        console.error("Error fetching municipality borders:", err);
-        // Don't show alert for borders - it's not critical
-        setMunicipalityBorders(null);
-      });
+    // Filter municipality borders client-side from loaded GeoJSON
+    if (allMunicipalityBorders && allMunicipalityBorders.features) {
+      let filteredFeatures = allMunicipalityBorders.features;
       
-  }, [selectedAreas]); // The "dependency array" - this re-runs the effect
+      // Filter by selected areas if any are selected
+      if (selectedAreas.length > 0) {
+        const validAreas = selectedAreas.filter(area => area && area.toLowerCase() !== 'unknown');
+        if (validAreas.length > 0) {
+          filteredFeatures = allMunicipalityBorders.features.filter(feature => {
+            // Try to match against MPIO_CNMBR property (from shapefile)
+            const featureName = feature.properties?.MPIO_CNMBR || feature.properties?.municipio || '';
+            return validAreas.some(area => matchMunicipality(featureName, area));
+          });
+        }
+      }
+      
+      // Create filtered GeoJSON
+      const filteredGeoJSON = {
+        type: 'FeatureCollection',
+        features: filteredFeatures
+      };
+      
+      setMunicipalityBorders(filteredGeoJSON);
+      console.log(`Filtered municipality borders: ${filteredFeatures.length} features (from ${allMunicipalityBorders.features.length} total)`);
+    } else {
+      // If GeoJSON not loaded yet, clear borders
+      setMunicipalityBorders(null);
+    }
+      
+  }, [selectedAreas, allMunicipalityBorders]); // The "dependency array" - this re-runs the effect
 
   
   // --- Event Handlers ---
@@ -730,10 +787,10 @@ function App() {
               .then(status => {
                 console.log('Training status:', status.status, status.progress || '');
                 
-                if (status.status === 'finished') {
+                if (status.status === 'completed') {
                   clearInterval(pollInterval);
                   setIsRetraining(false);
-                  alert(`✅ Model training completed!\n\n${status.result?.message || 'Training finished successfully'}\n\nResults: ${status.result?.experiment_dir || 'experiments directory'}`);
+                  alert(`✅ Model training completed!\n\n${status.progress_message || 'Training finished successfully'}\n\nResults: ${status.result?.experiment_dir || 'experiments directory'}`);
                   
                   // Refresh map data to show updated predictions
                   const currentAreas = [...selectedAreas];
@@ -742,7 +799,7 @@ function App() {
                 } else if (status.status === 'failed') {
                   clearInterval(pollInterval);
                   setIsRetraining(false);
-                  alert(`❌ Model training failed!\n\nError: ${status.error || status.result?.error || 'Unknown error'}`);
+                  alert(`❌ Model training failed!\n\nError: ${status.error || status.error_message || 'Unknown error'}`);
                 }
                 // If status is 'queued' or 'started', continue polling
               })
@@ -945,33 +1002,38 @@ function App() {
         const borderOutlineIndex = borderOutlineLayer ? layers.findIndex(l => l.id === 'municipality-borders-outline') : -1;
         const confirmedEventsIndex = confirmedEventsLayer ? layers.findIndex(l => l.id === 'confirmed-events') : -1;
         
-        // STEP 1: Ensure predictions are at the BOTTOM (lowest index)
-        // Move prediction layer to be before all other data layers if it's not first
+        // STEP 1: Ensure predictions are at the BOTTOM (lowest index among data layers)
+        // Move prediction layer to be before ALL other data layers
         if (predictionLayer && predictionIndex >= 0) {
           // Find the first data layer (should be predictions)
-          let firstDataLayerIndex = -1;
+          let firstDataLayerId = null;
           for (let i = 0; i < layers.length; i++) {
             const layerId = layers[i].id;
             if (layerId === 'prediction-points' || layerId === 'municipality-borders-fill' || 
                 layerId === 'municipality-borders-outline' || layerId === 'confirmed-events') {
-              firstDataLayerIndex = i;
+              firstDataLayerId = layerId;
               break;
             }
           }
           
-          // If predictions are not first, move them to be first
-          if (firstDataLayerIndex >= 0 && layers[firstDataLayerIndex].id !== 'prediction-points') {
-            map.moveLayer('prediction-points', layers[firstDataLayerIndex].id);
+          // If predictions are not first among data layers, move them to be first
+          if (firstDataLayerId && firstDataLayerId !== 'prediction-points') {
+            map.moveLayer('prediction-points', firstDataLayerId);
           }
         }
         
         // STEP 2: Ensure borders come after predictions
-        if (predictionLayer && borderFillLayer && predictionIndex >= 0 && borderFillIndex >= 0) {
-          if (borderFillIndex < predictionIndex) {
+        // Re-check indices after potential moves in STEP 1
+        const currentLayers = map.getStyle().layers;
+        const currentPredictionIndex = predictionLayer ? currentLayers.findIndex(l => l.id === 'prediction-points') : -1;
+        const currentBorderFillIndex = borderFillLayer ? currentLayers.findIndex(l => l.id === 'municipality-borders-fill') : -1;
+        
+        if (predictionLayer && borderFillLayer && currentPredictionIndex >= 0 && currentBorderFillIndex >= 0) {
+          if (currentBorderFillIndex < currentPredictionIndex) {
             // Border fill is before predictions, move it after
             // Find what comes after predictions
-            for (let i = predictionIndex + 1; i < layers.length; i++) {
-              const nextLayerId = layers[i].id;
+            for (let i = currentPredictionIndex + 1; i < currentLayers.length; i++) {
+              const nextLayerId = currentLayers[i].id;
               if (nextLayerId !== 'municipality-borders-fill' && nextLayerId !== 'municipality-borders-outline') {
                 map.moveLayer('municipality-borders-fill', nextLayerId);
                 break;
@@ -980,14 +1042,21 @@ function App() {
           }
         }
         
-        if (borderFillLayer && borderOutlineLayer && borderFillIndex >= 0 && borderOutlineIndex >= 0) {
-          if (borderOutlineIndex < borderFillIndex) {
-            // Border outline is before border fill, move it after
-            for (let i = borderFillIndex + 1; i < layers.length; i++) {
-              const nextLayerId = layers[i].id;
-              if (nextLayerId !== 'municipality-borders-outline') {
-                map.moveLayer('municipality-borders-outline', nextLayerId);
-                break;
+        if (borderFillLayer && borderOutlineLayer) {
+          // Re-check after potential move
+          const updatedLayers = map.getStyle().layers;
+          const updatedBorderFillIndex = updatedLayers.findIndex(l => l.id === 'municipality-borders-fill');
+          const updatedBorderOutlineIndex = updatedLayers.findIndex(l => l.id === 'municipality-borders-outline');
+          
+          if (updatedBorderFillIndex >= 0 && updatedBorderOutlineIndex >= 0) {
+            if (updatedBorderOutlineIndex < updatedBorderFillIndex) {
+              // Border outline is before border fill, move it after
+              for (let i = updatedBorderFillIndex + 1; i < updatedLayers.length; i++) {
+                const nextLayerId = updatedLayers[i].id;
+                if (nextLayerId !== 'municipality-borders-outline') {
+                  map.moveLayer('municipality-borders-outline', nextLayerId);
+                  break;
+                }
               }
             }
           }
@@ -1043,7 +1112,7 @@ function App() {
         // Silently fail - layers might not exist yet or already be in correct order
         console.debug('Layer reordering:', err);
       }
-    }, 150); // Small delay to ensure layers are added
+    }, 200); // Delay to ensure layers are fully added before reordering
     
     return () => clearTimeout(timeoutId);
   }, [showPrediction, showConfirmedEvents, predictionData, municipalityBorders, confirmedEvents, mapReady, mapStyle]);
@@ -1461,6 +1530,21 @@ function App() {
             </svg>
             <span>Red triangle icons represent confirmed mine events</span>
           </div>
+          <button 
+            onClick={() => setShowEventsPanel(!showEventsPanel)}
+            style={{
+              width: '100%',
+              padding: '8px',
+              marginTop: '12px',
+              backgroundColor: showEventsPanel ? '#007bff' : '#6c757d',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            {showEventsPanel ? 'Hide' : 'Show'} Confirmed Events Panel ({confirmedEvents.length})
+          </button>
         </div>
 
         <div className="control-group">
@@ -1528,52 +1612,6 @@ function App() {
               Click on map to add event, click on existing event to remove
             </div>
           )}
-        </div>
-
-        <div className="control-group">
-          <strong>Data Management</strong>
-          <button 
-            onClick={() => {
-              setSelectedPoint(null);
-              setLabelForm({ 
-                label: null, 
-                notes: '', 
-                manualLat: '', 
-                manualLon: '',
-                useManualCoords: true 
-              });
-              setShowLabelDialog(true);
-            }}
-            style={{
-              width: '100%',
-              padding: '8px',
-              marginTop: '5px',
-              backgroundColor: '#28a745',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              marginBottom: '5px'
-            }}
-          >
-            Add Label Manually
-          </button>
-          <button 
-            onClick={() => setShowEventsPanel(!showEventsPanel)}
-            style={{
-              width: '100%',
-              padding: '8px',
-              marginTop: '5px',
-              backgroundColor: showEventsPanel ? '#007bff' : '#6c757d',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              marginBottom: '5px'
-            }}
-          >
-            {showEventsPanel ? 'Hide' : 'Show'} Confirmed Events Panel ({confirmedEvents.length})
-          </button>
         </div>
 
         <div className="control-group">
@@ -2304,7 +2342,7 @@ function App() {
             </div>
             {confirmedEvents.length === 0 ? (
               <div style={{ textAlign: 'center', color: '#666', padding: '20px' }}>
-                No confirmed events yet. Add labels with value "1" to create events.
+                No confirmed events yet. Click on the map to add confirmed events.
               </div>
             ) : (
               <div>

@@ -4,12 +4,13 @@ import os
 os.environ.setdefault('OBJC_DISABLE_INITIALIZE_FORK_SAFETY', 'YES')
 
 import requests
+import json
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from datetime import datetime
 from math import isfinite
 from dotenv import load_dotenv
-from models import db, Location, UserLabel, ConfirmedEvent
+from models import db, Location, UserLabel, ConfirmedEvent, TrainingJob
 
 # Optional municipality borders import (may fail if shapefile missing)
 try:
@@ -27,17 +28,7 @@ import subprocess
 import glob
 import sys
 
-# Optional Redis/RQ imports for background jobs
-try:
-    from rq import Queue
-    from rq.job import Job
-    from redis import Redis
-    RQ_AVAILABLE = True
-except ImportError:
-    RQ_AVAILABLE = False
-    Queue = None
-    Job = None
-    Redis = None
+# Redis/RQ removed - using database-based async job queue for cost optimization
 
 # Optional imports for model prediction (only needed when recalculating predictions)
 try:
@@ -85,26 +76,19 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 
 # Initialize database
 db.init_app(app)
-# Note: Database connection will be tested on first request
 
-# Redis Queue configuration for background jobs
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-redis_conn = None
-task_queue = None
-if RQ_AVAILABLE:
-    try:
-        redis_conn = Redis.from_url(REDIS_URL)
-        # Test connection
-        redis_conn.ping()
-        task_queue = Queue('model_training', connection=redis_conn)
-        print("✓ Redis connection established for background jobs", file=sys.stdout, flush=True)
-    except Exception as e:
-        print(f"⚠️  Warning: Redis not available ({str(e)}). Background jobs will not work.", file=sys.stdout, flush=True)
-        print("   Set REDIS_URL environment variable to enable background model training.", file=sys.stdout, flush=True)
-        redis_conn = None
-        task_queue = None
-else:
-    print("⚠️  Warning: rq/redis packages not installed. Background jobs will not work.", file=sys.stdout, flush=True)
+# Skip table creation on startup to avoid blocking container initialization
+# Tables will be created on first database access or can be created manually
+print("ℹ️  Skipping database table creation on startup (will be created on first access)", file=sys.stdout, flush=True)
+# with app.app_context():
+#     try:
+#         db.create_all()
+#         print("✓ Database tables created/verified", file=sys.stdout, flush=True)
+#     except Exception as e:
+#         print(f"⚠️  Warning: Could not create tables: {str(e)}", file=sys.stdout, flush=True)
+
+# Using database-based async job queue (no Redis needed for cost optimization)
+print("ℹ️  Using database-based async job queue (cost-optimized mode)", file=sys.stdout, flush=True)
 
 # Helper Functions
 def calculate_risk_levels(locations, score_column='risk_score'):
@@ -481,14 +465,14 @@ def add_label():
             existing_label.notes = notes
             existing_label.updated_at = datetime.utcnow()
             
-            # If changing from 1 to 0, remove the confirmed event
+            # If changing from 1 to 0, remove the confirmed event (if it was auto-created)
             if old_label == 1 and label == 0:
                 _remove_confirmed_event_from_label(location.id)
             
             db.session.commit()
             
-            if label == 1:
-                _ensure_confirmed_event(location.id, location)
+            # Labels with value 1 are no longer automatically converted to confirmed events
+            # Users must manually create confirmed events if needed
             
             return jsonify(existing_label.to_dict())
         else:
@@ -496,8 +480,8 @@ def add_label():
             db.session.add(new_label)
             db.session.commit()
             
-            if label == 1:
-                _ensure_confirmed_event(location.id, location)
+            # Labels with value 1 are no longer automatically converted to confirmed events
+            # Users must manually create confirmed events if needed
             
             return jsonify(new_label.to_dict()), 201
             
@@ -1148,7 +1132,8 @@ def recalculate_and_predict():
 def retrain_model():
     """
     Retrain the model with updated labels and confirmed events.
-    This submits a background job and returns immediately.
+    Creates a job in the database and triggers EC2 worker (asynchronous).
+    Returns immediately with job_id to prevent timeouts.
     Use /api/job_status/<job_id> to check progress.
     """
     try:
@@ -1159,375 +1144,71 @@ def retrain_model():
         objective = data.get('objective', 'irm')
         n_step = data.get('n_step', 2)
         
-        # If Redis is available, submit as background job
-        if RQ_AVAILABLE and task_queue:
-            print(f"🔄 Submitting model training job...")
-            print(f"  Municipio: {municipio}")
-            print(f"  Subset: {subset}")
-            print(f"  Model: {model_name}")
-            print(f"  Objective: {objective}")
-            
-            # Import task function
-            from tasks import train_model_task
-            
-            # Submit job to queue
-            job = task_queue.enqueue(
-                train_model_task,
-                municipio=municipio,
-                subset=subset,
-                model_name=model_name,
-                objective=objective,
-                n_step=n_step,
-                db_url=DATABASE_URL,
-                job_timeout=3600,  # 1 hour timeout
-                result_ttl=86400   # Keep results for 24 hours
-            )
-            
-            return jsonify({
-                "message": "Model training job submitted successfully",
-                "job_id": job.id,
-                "status": "queued",
-                "status_url": f"/api/job_status/{job.id}"
-            }), 202
-        
-        # Fallback: Run synchronously if Redis is not available
-        print(f"🔄 Running model training synchronously (Redis not available)...")
+        # Asynchronous mode: Create job in database and trigger EC2 worker
+        # This prevents timeout errors for long-running training jobs (hours)
+        print(f"🔄 Creating training job in database (asynchronous mode)...")
         print(f"  Municipio: {municipio}")
         print(f"  Subset: {subset}")
         print(f"  Model: {model_name}")
         print(f"  Objective: {objective}")
         
-        # First, recalculate distances if confirmed events exist
-        confirmed_events = ConfirmedEvent.query.all()
-        if len(confirmed_events) > 0:
-            print("  Recalculating distances first...")
-            # Handle case where dist_old_mine column doesn't exist yet
-            try:
-                all_locations = Location.query.all()
-            except Exception as db_error:
-                # If dist_old_mine column doesn't exist, use raw SQL to query without it
-                if 'dist_old_mine' in str(db_error) or 'UndefinedColumn' in str(db_error):
-                    print("  ⚠️  dist_old_mine column not found. Querying without it...")
-                    db.session.rollback()
-                    from sqlalchemy import text
-                    query = text("""
-                        SELECT id, lat, lon, municipio, risk_score, risk_score_lr, risk_level,
-                               elevation, rainfall, temperature, population_2012, hist_mines,
-                               created_at, updated_at
-                        FROM locations
-                    """)
-                    result = db.session.execute(query)
-                    # Convert to Location objects manually
-                    all_locations = []
-                    for row in result:
-                        loc = Location()
-                        loc.id = row.id
-                        loc.lat = row.lat
-                        loc.lon = row.lon
-                        loc.municipio = row.municipio
-                        loc.risk_score = row.risk_score
-                        loc.risk_score_lr = row.risk_score_lr
-                        loc.risk_level = row.risk_level
-                        loc.elevation = row.elevation
-                        loc.rainfall = row.rainfall
-                        loc.temperature = row.temperature
-                        loc.population_2012 = row.population_2012
-                        loc.hist_mines = row.hist_mines
-                        loc.created_at = row.created_at
-                        loc.updated_at = row.updated_at
-                        loc.dist_old_mine = None
-                        all_locations.append(loc)
-                else:
-                    db.session.rollback()
-                    raise
-            
-            if all_locations:
-                # Check if dist_old_mine column exists, if not, add it
-                from sqlalchemy import text, inspect
-                inspector = inspect(db.engine)
-                columns = [col['name'] for col in inspector.get_columns('locations')]
-                column_exists = 'dist_old_mine' in columns
-                
-                if not column_exists:
-                    print("  Adding dist_old_mine column to database...")
-                    db.session.execute(text("ALTER TABLE locations ADD COLUMN dist_old_mine FLOAT"))
-                    db.session.commit()
-                    column_exists = True
-                
-                grid_data = {
-                    'lat': [loc.lat for loc in all_locations],
-                    'lon': [loc.lon for loc in all_locations]
-                }
-                grid_df = pd.DataFrame(grid_data)
-                
-                poi_data = {
-                    'lat': [event.lat for event in confirmed_events],
-                    'lon': [event.lon for event in confirmed_events]
-                }
-                poi_df = pd.DataFrame(poi_data)
-                
-                distances = distance_to_closest_point(grid_df, poi_df)
-                
-                # Use bulk update for better performance
-                if column_exists:
-                    update_query = text("""
-                        UPDATE locations 
-                        SET dist_old_mine = :distance 
-                        WHERE id = :location_id
-                    """)
-                    for i, location in enumerate(all_locations):
-                        db.session.execute(
-                            update_query,
-                            {'distance': float(distances[i]), 'location_id': location.id}
-                        )
-                    db.session.commit()
-                else:
-                    for i, location in enumerate(all_locations):
-                        location.dist_old_mine = float(distances[i])
-                    db.session.commit()
-                print("  ✓ Distances recalculated")
+        # Generate unique job ID
+        import uuid
+        from datetime import datetime
+        job_id = f"train_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
         
-        # Generate timestamp for this training run
-        timestamp = datetime.now().strftime("%m%d%Y%H%M%S")
+        # Create job record in database
+        job = TrainingJob(
+            id=job_id,
+            job_type='retrain',
+            status='pending',
+            municipio=municipio,
+            subset=subset,
+            model_name=model_name,
+            objective=objective,
+            n_step=n_step,
+            progress=0.0,
+            progress_message="Job created, waiting for EC2 worker..."
+        )
+        db.session.add(job)
+        db.session.commit()
         
-        # Create experiments directory if it doesn't exist
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        experiments_dir = os.path.join(script_dir, 'experiments')
-        os.makedirs(experiments_dir, exist_ok=True)
-        os.makedirs(os.path.join(experiments_dir, timestamp), exist_ok=True)
-        
-        # Prepare command to run main.py
-        main_script = os.path.join(script_dir, 'main.py')
-        
-        if not os.path.exists(main_script):
-            return jsonify({
-                "error": f"main.py not found at {main_script}"
-            }), 404
-        
-        # Verify train_val_stream directory exists
-        train_val_dir = os.path.join(script_dir, 'train_val_stream', municipio)
-        if not os.path.exists(train_val_dir):
-            return jsonify({
-                "error": f"Train/val split directory not found: {train_val_dir}",
-                "available_directories": [d for d in os.listdir(os.path.join(script_dir, 'train_val_stream')) if os.path.isdir(os.path.join(script_dir, 'train_val_stream', d))]
-            }), 404
-        
-        # Find Python interpreter with ML dependencies (torch, etc.)
-        # main.py needs torch and other ML libraries
-        # Prefer project-level ML venv, then system Python (avoid backend venv)
-        
-        python_interpreter = None
-        backend_venv_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # First, check for ML venv in project root (preferred)
-        ml_venv_python = os.path.join(script_dir, 'ml_venv', 'bin', 'python')
-        if os.path.exists(ml_venv_python):
-            # Verify it has torch
-            try:
-                check_result = subprocess.run(
-                    [ml_venv_python, '-c', 'import torch; print("OK")'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3
-                )
-                if check_result.returncode == 0:
-                    python_interpreter = ml_venv_python
-                    print(f"  ✓ Using ML venv Python: {python_interpreter}")
-            except:
-                pass
-        
-        # If ML venv not found or doesn't have torch, try system Python paths
-        if not python_interpreter:
-            system_python_paths = [
-                '/opt/homebrew/bin/python3',
-                '/usr/local/bin/python3',
-                '/usr/bin/python3',
-            ]
-            
-            for python_path in system_python_paths:
-                if os.path.exists(python_path):
-                    # Resolve symlinks to get real path
-                    try:
-                        real_path = os.path.realpath(python_path)
-                        # Check it's not inside the backend venv
-                        if 'reland-backend' not in real_path or 'venv' not in real_path:
-                            python_interpreter = python_path
-                            print(f"  Using system Python: {python_interpreter}")
-                            break
-                    except:
-                        # If realpath fails, just use it if it exists
-                        python_interpreter = python_path
-                        print(f"  Using system Python: {python_interpreter}")
-                        break
-        
-        # If we still don't have one, try to find python3 while explicitly avoiding venv
-        if not python_interpreter:
-            try:
-                # Use /usr/bin/env with a clean environment (no venv activation)
-                env = os.environ.copy()
-                # Remove VIRTUAL_ENV to avoid venv activation
-                env.pop('VIRTUAL_ENV', None)
-                env.pop('VIRTUAL_ENV_PROMPT', None)
-                # Remove backend venv from PATH
-                if 'PATH' in env:
-                    paths = env['PATH'].split(os.pathsep)
-                    paths = [p for p in paths if 'reland-backend/venv' not in p]
-                    env['PATH'] = os.pathsep.join(paths)
-                
-                result = subprocess.run(
-                    ['/usr/bin/env', 'python3', '--version'],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                    env=env
-                )
-                if result.returncode == 0:
-                    # Get the actual path
-                    which_result = subprocess.run(
-                        ['/usr/bin/env', 'which', 'python3'],
-                        capture_output=True,
-                        text=True,
-                        timeout=2,
-                        env=env
-                    )
-                    if which_result.returncode == 0:
-                        candidate = which_result.stdout.strip()
-                        # Double-check it's not the backend venv
-                        if 'reland-backend/venv' not in candidate:
-                            python_interpreter = candidate
-                            print(f"  Using Python from PATH: {python_interpreter}")
-            except:
-                pass
-        
-        # Last resort: use /opt/homebrew/bin/python3 if it exists (common on macOS)
-        if not python_interpreter and os.path.exists('/opt/homebrew/bin/python3'):
-            python_interpreter = '/opt/homebrew/bin/python3'
-            print(f"  Using fallback Python: {python_interpreter}")
-        
-        # Verify torch is available
-        if python_interpreter:
-            torch_available = False
-            try:
-                check_result = subprocess.run(
-                    [python_interpreter, '-c', 'import torch; print("OK")'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3
-                )
-                if check_result.returncode == 0:
-                    torch_available = True
-                    print(f"  ✓ Verified: torch is available")
-            except:
-                pass
-            
-            if not torch_available:
-                print(f"  ❌ ERROR: torch not found in {python_interpreter}")
-                print(f"  Please install torch: {python_interpreter} -m pip install torch")
-                return jsonify({
-                    "error": "PyTorch (torch) is not installed in the selected Python interpreter",
-                    "python_interpreter": python_interpreter,
-                    "solution": f"Install torch with: {python_interpreter} -m pip install torch",
-                    "note": "The training script requires torch. Install it in the system Python, not the backend venv."
-                }), 500
-        else:
-            return jsonify({
-                "error": "Could not find a suitable Python interpreter",
-                "note": "Please ensure system Python (not backend venv) is available and has torch installed."
-            }), 500
-        
-        # Build command
-        cmd = [
-            python_interpreter, main_script,
-            '--timestamp', timestamp,
-            '--municipio', municipio,
-            '--subset', subset,
-            '--model', model_name,
-            '--objective', objective,
-            '--n_step', str(n_step)
-        ]
-        
-        # Set environment variables for database access
-        env = os.environ.copy()
-        if DATABASE_URL:
-            env['DATABASE_URL'] = DATABASE_URL
-        
-        print(f"  Running command: {' '.join(cmd)}")
-        print(f"  Working directory: {script_dir}")
-        print(f"  This may take several minutes...")
-        
-        # Run the training script
+        # Trigger EC2 worker instance
+        ec2_instance_id = None
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=script_dir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=3600  # 1 hour timeout
-            )
-        except subprocess.TimeoutExpired:
-            return jsonify({
-                "error": "Model training timed out (exceeded 1 hour)",
-                "note": "Training may still be running in the background. Check logs."
-            }), 500
-        
-        if result.returncode != 0:
-            error_msg = result.stderr or result.stdout
-            print(f"  ❌ Training failed with return code {result.returncode}")
-            print(f"  STDOUT:\n{result.stdout}")
-            print(f"  STDERR:\n{result.stderr}")
+            from aws_ec2_helper import trigger_worker_instance
+            launch_template_name = os.getenv('EC2_LAUNCH_TEMPLATE_NAME', 'reland-worker-template')
+            instance_info = trigger_worker_instance(launch_template_name=launch_template_name)
             
-            # Check for common errors and provide helpful messages
-            error_lower = error_msg.lower()
-            helpful_hint = None
-            
-            if 'modulenotfounderror' in error_lower and 'torch' in error_lower:
-                helpful_hint = (
-                    "PyTorch (torch) is not installed. "
-                    "Install it with: pip install torch "
-                    "Or install all ML dependencies in your Python environment."
-                )
-            elif 'modulenotfounderror' in error_lower:
-                missing_module = error_msg.split("'")[1] if "'" in error_msg else "unknown module"
-                helpful_hint = f"Missing Python module: {missing_module}. Install it with: pip install {missing_module}"
-            
-            # Try to extract the most relevant error message
-            error_lines = error_msg.split('\n')
-            relevant_error = '\n'.join(error_lines[-20:])  # Last 20 lines usually contain the error
-            
-            response_data = {
-                "error": "Model training failed",
-                "return_code": result.returncode,
-                "details": relevant_error[:1000],  # Limit error message length
-                "full_stderr": result.stderr[:2000] if result.stderr else None,
-                "full_stdout": result.stdout[:2000] if result.stdout else None
-            }
-            
-            if helpful_hint:
-                response_data["hint"] = helpful_hint
-            
-            return jsonify(response_data), 500
-        
-        print(f"  ✓ Model training completed")
-        print(f"  Results saved to: ./experiments/{timestamp}/")
-        
-        # Try to load and save predictions to database
-        try:
-            predicted_proba_path = os.path.join(script_dir, f'experiments/{timestamp}/predicted_proba.csv')
-            if os.path.exists(predicted_proba_path):
-                predictions_df = pd.read_csv(predicted_proba_path)
-                from save_predictions_db import save_predictions_to_db_orm
-                save_predictions_to_db_orm(predictions_df, db.session, Location)
-                print(f"  ✓ Predictions saved to database")
+            if instance_info and isinstance(instance_info, dict):
+                ec2_instance_id = instance_info.get('instance_id')
+                if ec2_instance_id:
+                    job.ec2_instance_id = ec2_instance_id
+                    job.progress_message = f"EC2 worker instance {ec2_instance_id} launched"
+                    db.session.commit()
+                    print(f"  ✓ EC2 worker instance launched: {ec2_instance_id}")
+                else:
+                    raise ValueError("EC2 instance ID not found in response")
+            else:
+                raise ValueError("Failed to launch EC2 worker instance")
+                
         except Exception as e:
-            print(f"  ⚠️  Could not save predictions to database: {str(e)}")
+            print(f"  ⚠️  Error launching EC2 worker: {str(e)}")
+            job.progress_message = f"Error launching EC2: {str(e)}"
+            job.status = 'failed'
+            db.session.commit()
+            return jsonify({
+                "error": f"Failed to launch EC2 worker: {str(e)}",
+                "job_id": job_id
+            }), 500
         
         return jsonify({
-            "message": "Model retraining completed successfully",
-            "timestamp": timestamp,
-            "experiment_dir": f"./experiments/{timestamp}/",
-            "predictions_saved": os.path.exists(predicted_proba_path) if 'predicted_proba_path' in locals() else False
-        }), 200
+            "message": "Model training job created successfully",
+            "job_id": job_id,
+            "status": "pending",
+            "ec2_instance_id": ec2_instance_id,
+            "status_url": f"/api/job_status/{job_id}"
+        }), 202
         
     except Exception as e:
         import traceback
@@ -1539,142 +1220,77 @@ def retrain_model():
 @app.route('/api/job_status/<job_id>', methods=['GET'])
 def get_job_status(job_id):
     """
-    Get the status of a background job.
-    Returns: queued, started, finished, failed, or not_found
+    Get the status of a training job from the database.
+    Returns: pending, running, completed, failed
     """
     try:
-        if not RQ_AVAILABLE or not redis_conn:
-            return jsonify({
-                "error": "Redis not available",
-                "message": "Cannot check job status without Redis"
-            }), 503
+        job = TrainingJob.query.get(job_id)
         
-        job = Job.fetch(job_id, connection=redis_conn)
+        if not job:
+            return jsonify({
+                "error": "Job not found",
+                "job_id": job_id
+            }), 404
         
         response = {
             "job_id": job.id,
-            "status": job.get_status(),
+            "job_type": job.job_type,
+            "status": job.status,
+            "progress": job.progress,
+            "progress_message": job.progress_message,
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "started_at": job.started_at.isoformat() if job.started_at else None,
-            "ended_at": job.ended_at.isoformat() if job.ended_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "ec2_instance_id": job.ec2_instance_id
         }
         
-        # Add progress if available
-        if job.meta and 'progress' in job.meta:
-            response['progress'] = job.meta['progress']
-        
-        # Add result if job is finished
-        if job.is_finished:
+        # Add result if job is completed
+        if job.status == 'completed' and job.result:
             try:
-                result = job.result
-                if result:
-                    response['result'] = result
-            except Exception as e:
-                response['result_error'] = str(e)
+                response['result'] = json.loads(job.result)
+            except (json.JSONDecodeError, TypeError):
+                response['result'] = job.result
         
         # Add error if job failed
-        if job.is_failed:
-            response['error'] = str(job.exc_info) if job.exc_info else "Job failed"
+        if job.status == 'failed':
+            response['error'] = job.error_message or "Job failed"
         
         return jsonify(response), 200
         
     except Exception as e:
+        import traceback
+        print(f"Error in get_job_status: {str(e)}")
+        print(traceback.format_exc())
         return jsonify({
-            "error": "Job not found",
-            "message": str(e),
-            "job_id": job_id
-        }), 404
+            "error": "Failed to get job status",
+            "message": str(e)
+        }), 500
 
 
 @app.route('/api/jobs', methods=['GET'])
 def list_jobs():
     """
-    List recent jobs in the queue.
+    List recent training jobs from the database.
     """
     try:
-        if not RQ_AVAILABLE or not task_queue:
-            return jsonify({
-                "error": "Background job queue not available"
-            }), 503
+        # Get recent jobs from database (last 50)
+        jobs_query = TrainingJob.query.order_by(TrainingJob.created_at.desc()).limit(50).all()
         
-        # Get jobs from different states
-        queued_jobs = task_queue.get_jobs()
-        started_jobs = task_queue.started_job_registry.get_job_ids()
-        finished_jobs = task_queue.finished_job_registry.get_job_ids()
-        failed_jobs = task_queue.failed_job_registry.get_job_ids()
-        
-        jobs = []
-        
-        # Add queued jobs
-        for job in queued_jobs[:10]:  # Limit to 10 most recent
-            jobs.append({
-                "job_id": job.id,
-                "status": "queued",
-                "created_at": job.created_at.isoformat() if job.created_at else None
-            })
-        
-        # Add started jobs
-        for job_id in started_jobs[:10]:
-            try:
-                if not RQ_AVAILABLE:
-                    break
-                job = Job.fetch(job_id, connection=redis_conn)
-                jobs.append({
-                    "job_id": job.id,
-                    "status": "started",
-                    "created_at": job.created_at.isoformat() if job.created_at else None,
-                    "started_at": job.started_at.isoformat() if job.started_at else None,
-                    "progress": job.meta.get('progress') if job.meta else None
-                })
-            except:
-                pass
-        
-        # Add finished jobs
-        for job_id in finished_jobs[:10]:
-            try:
-                if not RQ_AVAILABLE:
-                    break
-                job = Job.fetch(job_id, connection=redis_conn)
-                jobs.append({
-                    "job_id": job.id,
-                    "status": "finished",
-                    "created_at": job.created_at.isoformat() if job.created_at else None,
-                    "ended_at": job.ended_at.isoformat() if job.ended_at else None
-                })
-            except:
-                pass
-        
-        # Add failed jobs
-        for job_id in failed_jobs[:10]:
-            try:
-                if not RQ_AVAILABLE:
-                    break
-                job = Job.fetch(job_id, connection=redis_conn)
-                jobs.append({
-                    "job_id": job.id,
-                    "status": "failed",
-                    "created_at": job.created_at.isoformat() if job.created_at else None,
-                    "ended_at": job.ended_at.isoformat() if job.ended_at else None
-                })
-            except:
-                pass
-        
-        # Sort by created_at (most recent first)
-        jobs.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        # Use to_dict method from model for consistency
+        jobs = [job.to_dict() for job in jobs_query]
         
         return jsonify({
-            "jobs": jobs[:20],  # Return top 20 most recent
-            "total_queued": len(queued_jobs),
-            "total_started": len(started_jobs),
-            "total_finished": len(finished_jobs),
-            "total_failed": len(failed_jobs)
+            "jobs": jobs
         }), 200
         
     except Exception as e:
         import traceback
-        print(f"Error listing jobs: {str(e)}")
+        print(f"Error in list_jobs: {str(e)}")
         print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": "Failed to list jobs",
+            "message": str(e)
+        }), 500
 
 
 def _ensure_confirmed_event(location_id, location):
