@@ -1,4 +1,5 @@
 import os
+import sys
 # Set macOS fork safety BEFORE any imports that might trigger Objective-C
 # This must be set before any imports to prevent fork() crashes on macOS
 os.environ.setdefault('OBJC_DISABLE_INITIALIZE_FORK_SAFETY', 'YES')
@@ -26,7 +27,6 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import subprocess
 import glob
-import sys
 
 # Redis/RQ removed - using database-based async job queue for cost optimization
 
@@ -50,7 +50,6 @@ CORS(app)
 # Environment variables (from EB) take precedence over .env file
 DATABASE_URL = os.getenv('DATABASE_URL')
 # Force print to stdout so it shows in logs
-import sys
 if DATABASE_URL:
     print(f"✓ Using DATABASE_URL from environment: {DATABASE_URL[:50]}...", file=sys.stdout, flush=True)
     print(f"✓ Full DATABASE_URL: {DATABASE_URL}", file=sys.stdout, flush=True)
