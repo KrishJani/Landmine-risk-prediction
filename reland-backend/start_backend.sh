@@ -3,10 +3,12 @@
 
 cd "$(dirname "$0")"
 
-# Activate virtual environment
-source .venv/bin/activate
+# Activate virtual environment if it exists
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+fi
 
 # Start the Flask server
 echo "Starting RELand Backend Server..."
-python backend-app.py
+python app.py
 

@@ -35,9 +35,27 @@ class EventDB(Dataset):
         
         # Get database URL
         if db_url is None:
-            db_url = os.getenv('DATABASE_URL')
+            # Match backend behavior:
+            # - Production: DATABASE_URL (RDS) is required
+            # - Local: LOCAL_DATABASE_URL is required (no fallback to production DB)
+            env = os.getenv('FLASK_ENV', os.getenv('ENVIRONMENT', 'local')).lower()
+            if env in ['production', 'prod']:
+                db_url = os.getenv('DATABASE_URL')
+                if not db_url:
+                    raise ValueError(
+                        "DATABASE_URL environment variable is required in production. "
+                        "Please set it in your deployment platform (AWS App Runner, Docker, etc.)."
+                    )
+            else:
+                # Local mode: ONLY use LOCAL_DATABASE_URL (never touch production DB)
+                db_url = os.getenv('LOCAL_DATABASE_URL')
+                if not db_url:
+                    raise ValueError(
+                        "LOCAL_DATABASE_URL environment variable is required for local development. "
+                        "Set it in your .env file to avoid accidentally connecting to production database."
+                    )
         if not db_url:
-            raise ValueError("DATABASE_URL environment variable not set")
+            raise ValueError("Database URL not set.")
         
         # Load static features from CSV (fast, one-time read)
         # Always use absolute paths to avoid issues with different working directories

@@ -11,7 +11,8 @@ load_dotenv()
 
 def export_local_database():
     """Export local database to SQL file"""
-    local_db_url = os.getenv('LOCAL_DATABASE_URL', 'postgresql://reland_user:reland_password123@localhost:5432/reland_db')
+    # Try to get from .env file first, then fallback to default
+    local_db_url = os.getenv('DATABASE_URL') or os.getenv('LOCAL_DATABASE_URL', 'postgresql://reland_user:reland_password123@localhost:5432/reland_db')
     backup_file = 'local_db_backup.sql'
     
     print("="*50)
@@ -20,12 +21,14 @@ def export_local_database():
     
     try:
         # Use pg_dump to export
+        # Try with version compatibility flag first
         cmd = [
             'pg_dump',
             '--no-owner',
             '--no-acl',
             '--clean',
             '--if-exists',
+            '--version', '17.6',  # Specify target version for compatibility
             local_db_url,
             '-f', backup_file
         ]
@@ -33,6 +36,13 @@ def export_local_database():
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
+            # If version flag doesn't work, try without it
+            if 'version' in result.stderr.lower() or 'mismatch' in result.stderr.lower():
+                print("⚠️  pg_dump version mismatch detected")
+                print("   Trying alternative approach...")
+                print("\n💡 Use Python-based migration instead:")
+                print(f"   python migrate_to_rds_python.py --rds-url '{rds_url if 'rds_url' in locals() else 'YOUR_RDS_URL'}'")
+                return None
             print(f"❌ Error exporting database:")
             print(result.stderr)
             return None

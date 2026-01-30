@@ -11,12 +11,9 @@ import sys
 # Add parent directory to path to import app
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Import app
-import importlib.util
-spec = importlib.util.spec_from_file_location("backend_app", os.path.join(os.path.dirname(__file__), "backend-app.py"))
-backend_app = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(backend_app)
-app = backend_app.app
+# Import app from refactored structure
+from app import create_app
+app = create_app()
 
 if __name__ == '__main__':
     with app.app_context():

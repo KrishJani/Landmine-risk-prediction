@@ -144,6 +144,8 @@ function App() {
   // Loading state for recalculation and retraining
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [isRetraining, setIsRetraining] = useState(false);
+  // Model type for retrain/repredict: 'TabCmpt' (full) or 'Lightweight' (fast test)
+  const [retrainModelType, setRetrainModelType] = useState('TabCmpt');
   
   // Legend visibility state
   const [showLegend, setShowLegend] = useState(true);
@@ -715,8 +717,8 @@ function App() {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'TabCmpt',  // Default model
-        municipio: 'blockCV',  // Default municipio
+        model: retrainModelType,
+        municipio: 'blockCV',
         subset: 'full',
         objective: 'irm'
       })
@@ -743,7 +745,11 @@ function App() {
 
   // Handler for retrain model (async job submission)
   const handleRetrainModel = () => {
-    if (!window.confirm('This will retrain the model with updated labels and confirmed events. This may take 5-30 minutes. The job will run in the background. Continue?')) {
+    const isLightweight = retrainModelType === 'Lightweight';
+    const timeNote = isLightweight
+      ? 'Lightweight model trains in seconds (for testing).'
+      : 'This may take 5-30 minutes. The job will run in the background.';
+    if (!window.confirm(`This will retrain the model (${retrainModelType}) with updated labels and confirmed events. ${timeNote} Continue?`)) {
       return;
     }
     
@@ -756,9 +762,9 @@ function App() {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        municipio: 'blockCV',  // Default municipio
+        municipio: 'blockCV',
         subset: 'full',
-        model: 'TabCmpt',
+        model: retrainModelType,
         objective: 'irm',
         n_step: 2
       })
@@ -822,7 +828,7 @@ function App() {
       .catch(err => {
         setIsRetraining(false);
         console.error('Error submitting training job:', err);
-        alert('Error submitting training job. Please make sure the backend is running and Redis is configured.');
+        alert('Error submitting training job. Please make sure the backend is running and check the console for details.');
       });
   };
 
@@ -1641,6 +1647,17 @@ function App() {
           }}>
             Updates distances and re-predicts with existing model
           </div>
+          <label style={{ display: 'block', marginTop: '10px', fontSize: '12px' }}>
+            Model for retrain/repredict:
+          </label>
+          <select 
+            value={retrainModelType} 
+            onChange={e => setRetrainModelType(e.target.value)}
+            style={{ width: '100%', padding: '6px', marginTop: '4px', fontSize: '12px' }}
+          >
+            <option value="TabCmpt">TabCmpt (full, ~minutes)</option>
+            <option value="Lightweight">Lightweight (fast test, ~seconds)</option>
+          </select>
           <button 
             onClick={handleRetrainModel}
             disabled={isRetraining}

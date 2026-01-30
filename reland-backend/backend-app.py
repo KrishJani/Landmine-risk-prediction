@@ -38,29 +38,50 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 # Load environment variables from .env file
-# override=False ensures environment variables take precedence
-# Only load .env if DATABASE_URL is not already set (for local development)
-if not os.getenv('DATABASE_URL'):
-    load_dotenv()
+# Always load .env for local development; override=False so real env vars win
+load_dotenv(override=False)
 
 app = Flask(__name__)
 CORS(app)
 
 # Database configuration - PostgreSQL
-# Environment variables (from EB) take precedence over .env file
-DATABASE_URL = os.getenv('DATABASE_URL')
-# Force print to stdout so it shows in logs
-if DATABASE_URL:
-    print(f"✓ Using DATABASE_URL from environment: {DATABASE_URL[:50]}...", file=sys.stdout, flush=True)
-    print(f"✓ Full DATABASE_URL: {DATABASE_URL}", file=sys.stdout, flush=True)
+# Behavior:
+# - Local (default): LOCAL_DATABASE_URL is required (no fallback to production DATABASE_URL)
+# - Production (FLASK_ENV/ENVIRONMENT == production/prod): require DATABASE_URL (RDS)
+env = os.getenv('FLASK_ENV', os.getenv('ENVIRONMENT', 'local')).lower()
+if env in ['production', 'prod']:
+    # Production mode: use DATABASE_URL only (must be set by platform / AWS)
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    db_source = "DATABASE_URL (Production/RDS)"
+    if not DATABASE_URL:
+        raise ValueError(
+            "DATABASE_URL environment variable is required in production. "
+            "Please set it in your deployment platform (AWS App Runner, Docker, etc.)."
+        )
 else:
-    print("⚠️  DATABASE_URL not found in environment", file=sys.stdout, flush=True)
-    print(f"⚠️  Available env vars with 'DATABASE': {[k for k in os.environ.keys() if 'DATABASE' in k]}", file=sys.stdout, flush=True)
-if not DATABASE_URL:
-    raise ValueError(
-        "DATABASE_URL environment variable is not set. "
-        "Please create a .env file with DATABASE_URL=postgresql://user:password@localhost:5432/reland_db"
-    )
+    # Local mode: ONLY use LOCAL_DATABASE_URL (never touch production DATABASE_URL)
+    DATABASE_URL = os.getenv('LOCAL_DATABASE_URL')
+    if not DATABASE_URL:
+        # Fallback to default localhost connection (not production)
+        DATABASE_URL = 'postgresql://reland_user:reland_password123@localhost:5432/reland_db'
+        db_source = "Default localhost (Local)"
+        print("⚠️  WARNING: LOCAL_DATABASE_URL not set, using default localhost connection.", file=sys.stdout, flush=True)
+        print("   Set LOCAL_DATABASE_URL in .env for explicit local database configuration.", file=sys.stdout, flush=True)
+    else:
+        db_source = "LOCAL_DATABASE_URL (Local)"
+
+# Log which database we're using (mask password)
+print(f"💾 Database source: {db_source}", file=sys.stdout, flush=True)
+if '@' in DATABASE_URL:
+    parts = DATABASE_URL.split('@')
+    if len(parts) == 2:
+        user_part = parts[0].rsplit('/', 1)[0] + '/***'
+        db_url_display = user_part + '@' + parts[1]
+    else:
+        db_url_display = DATABASE_URL
+else:
+    db_url_display = DATABASE_URL
+print(f"💾 Database URL: {db_url_display}", file=sys.stdout, flush=True)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -408,7 +429,7 @@ def add_label():
         location = None
         
         if location_id:
-            location = Location.query.get(location_id)
+            location = db.session.get(Location, location_id)
             if not location:
                 return jsonify({"error": "Location not found"}), 404
         elif lat is not None and lon is not None:
@@ -486,6 +507,10 @@ def add_label():
             
     except Exception as e:
         db.session.rollback()
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(f"❌ Error in /api/labels POST: {str(e)}", file=sys.stdout, flush=True)
+        print(error_traceback, file=sys.stdout, flush=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -572,7 +597,7 @@ def add_confirmed_event():
 def update_confirmed_event(event_id):
     """Update a confirmed event"""
     try:
-        event = ConfirmedEvent.query.get(event_id)
+        event = db.session.get(ConfirmedEvent, event_id)
         if not event:
             return jsonify({"error": "Event not found"}), 404
         
@@ -607,7 +632,7 @@ def update_confirmed_event(event_id):
 def delete_confirmed_event(event_id):
     """Delete a confirmed event"""
     try:
-        event = ConfirmedEvent.query.get(event_id)
+        event = db.session.get(ConfirmedEvent, event_id)
         if not event:
             return jsonify({"error": "Event not found"}), 404
         
@@ -625,7 +650,7 @@ def delete_confirmed_event(event_id):
 def update_location(location_id):
     """Update a location's risk score and other data"""
     try:
-        location = Location.query.get(location_id)
+        location = db.session.get(Location, location_id)
         if not location:
             return jsonify({"error": "Location not found"}), 404
         
@@ -676,7 +701,7 @@ def bulk_update_locations():
             if not location_id:
                 continue
             
-            location = Location.query.get(location_id)
+            location = db.session.get(Location, location_id)
             if not location:
                 continue
             
@@ -1131,7 +1156,9 @@ def recalculate_and_predict():
 def retrain_model():
     """
     Retrain the model with updated labels and confirmed events.
-    Creates a job in the database and triggers EC2 worker (asynchronous).
+    Creates a job in the database and triggers worker (asynchronous).
+    - Local: spawns local worker subprocess
+    - Production: launches EC2 worker instance
     Returns immediately with job_id to prevent timeouts.
     Use /api/job_status/<job_id> to check progress.
     """
@@ -1143,13 +1170,17 @@ def retrain_model():
         objective = data.get('objective', 'irm')
         n_step = data.get('n_step', 2)
         
-        # Asynchronous mode: Create job in database and trigger EC2 worker
+        # Asynchronous mode: Create job in database and trigger worker
         # This prevents timeout errors for long-running training jobs (hours)
         print(f"🔄 Creating training job in database (asynchronous mode)...")
         print(f"  Municipio: {municipio}")
         print(f"  Subset: {subset}")
         print(f"  Model: {model_name}")
         print(f"  Objective: {objective}")
+        
+        # Determine environment: local vs production
+        env = os.getenv('FLASK_ENV', os.getenv('ENVIRONMENT', 'local')).lower()
+        is_production = env in ['production', 'prod']
         
         # Generate unique job ID
         import uuid
@@ -1167,39 +1198,75 @@ def retrain_model():
             objective=objective,
             n_step=n_step,
             progress=0.0,
-            progress_message="Job created, waiting for EC2 worker..."
+            progress_message="Job created..."
         )
         db.session.add(job)
         db.session.commit()
         
-        # Trigger EC2 worker instance
         ec2_instance_id = None
-        try:
-            from aws_ec2_helper import trigger_worker_instance
-            launch_template_name = os.getenv('EC2_LAUNCH_TEMPLATE_NAME', 'reland-worker-template')
-            instance_info = trigger_worker_instance(launch_template_name=launch_template_name)
-            
-            if instance_info and isinstance(instance_info, dict):
-                ec2_instance_id = instance_info.get('instance_id')
-                if ec2_instance_id:
-                    job.ec2_instance_id = ec2_instance_id
-                    job.progress_message = f"EC2 worker instance {ec2_instance_id} launched"
-                    db.session.commit()
-                    print(f"  ✓ EC2 worker instance launched: {ec2_instance_id}")
-                else:
-                    raise ValueError("EC2 instance ID not found in response")
-            else:
-                raise ValueError("Failed to launch EC2 worker instance")
-                
-        except Exception as e:
-            print(f"  ⚠️  Error launching EC2 worker: {str(e)}")
-            job.progress_message = f"Error launching EC2: {str(e)}"
-            job.status = 'failed'
+        if is_production:
+            # Production: Launch EC2 worker instance
+            job.progress_message = "Job created, waiting for EC2 worker..."
             db.session.commit()
-            return jsonify({
-                "error": f"Failed to launch EC2 worker: {str(e)}",
-                "job_id": job_id
-            }), 500
+            try:
+                from aws_ec2_helper import trigger_worker_instance
+                launch_template_name = os.getenv('EC2_LAUNCH_TEMPLATE_NAME', 'reland-worker-template')
+                instance_info = trigger_worker_instance(launch_template_name=launch_template_name)
+                
+                if instance_info and isinstance(instance_info, dict):
+                    ec2_instance_id = instance_info.get('instance_id')
+                    if ec2_instance_id:
+                        job.ec2_instance_id = ec2_instance_id
+                        job.progress_message = f"EC2 worker instance {ec2_instance_id} launched"
+                        db.session.commit()
+                        print(f"  ✓ EC2 worker instance launched: {ec2_instance_id}")
+                    else:
+                        raise ValueError("EC2 instance ID not found in response")
+                else:
+                    raise ValueError("Failed to launch EC2 worker instance")
+                    
+            except Exception as e:
+                print(f"  ⚠️  Error launching EC2 worker: {str(e)}")
+                job.progress_message = f"Error launching EC2: {str(e)}"
+                job.status = 'failed'
+                db.session.commit()
+                return jsonify({
+                    "error": f"Failed to launch EC2 worker: {str(e)}",
+                    "job_id": job_id
+                }), 500
+        else:
+            # Local: Spawn local worker subprocess
+            job.progress_message = "Job created, starting local worker..."
+            db.session.commit()
+            try:
+                # Get path to worker script
+                backend_dir = os.path.dirname(os.path.abspath(__file__))
+                worker_script = os.path.join(backend_dir, 'ec2_worker_main.py')
+                
+                if not os.path.exists(worker_script):
+                    raise FileNotFoundError(f"Worker script not found: {worker_script}")
+                
+                # Spawn worker subprocess (non-blocking)
+                subprocess.Popen(
+                    [sys.executable, worker_script, '--job-id', job_id],
+                    cwd=os.path.dirname(backend_dir),  # Project root
+                    env=os.environ.copy(),  # Inherit environment (including LOCAL_DATABASE_URL)
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True  # Detach from parent
+                )
+                job.progress_message = "Local worker started"
+                db.session.commit()
+                print(f"  ✓ Local worker started for job {job_id}")
+            except Exception as e:
+                print(f"  ⚠️  Error starting local worker: {str(e)}")
+                job.progress_message = f"Error starting local worker: {str(e)}"
+                job.status = 'failed'
+                db.session.commit()
+                return jsonify({
+                    "error": f"Failed to start local worker: {str(e)}",
+                    "job_id": job_id
+                }), 500
         
         return jsonify({
             "message": "Model training job created successfully",
@@ -1223,7 +1290,7 @@ def get_job_status(job_id):
     Returns: pending, running, completed, failed
     """
     try:
-        job = TrainingJob.query.get(job_id)
+        job = db.session.get(TrainingJob, job_id)
         
         if not job:
             return jsonify({
@@ -1288,6 +1355,50 @@ def list_jobs():
         print(traceback.format_exc())
         return jsonify({
             "error": "Failed to list jobs",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/api/last_trained_model', methods=['GET'])
+def get_last_trained_model():
+    """
+    Get when the last model was trained and its name (from most recent completed retrain job).
+    """
+    try:
+        job = (
+            TrainingJob.query.filter_by(job_type='retrain', status='completed')
+            .order_by(TrainingJob.completed_at.desc())
+            .first()
+        )
+        if not job:
+            return jsonify({
+                "message": "No model has been trained yet",
+                "last_trained_at": None,
+                "model_name": None,
+                "municipio": None,
+                "experiment_dir": None,
+                "job_id": None
+            }), 200
+        result_data = None
+        if job.result:
+            try:
+                result_data = json.loads(job.result)
+            except (TypeError, ValueError):
+                result_data = None
+        experiment_dir = (result_data.get('experiment_dir') if isinstance(result_data, dict) else None) or ''
+        return jsonify({
+            "last_trained_at": job.completed_at.isoformat() if job.completed_at else None,
+            "model_name": job.model_name or 'TabCmpt',
+            "municipio": job.municipio or 'blockCV',
+            "experiment_dir": experiment_dir,
+            "job_id": job.id,
+        }), 200
+    except Exception as e:
+        import traceback
+        print(f"Error in get_last_trained_model: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({
+            "error": "Failed to get last trained model",
             "message": str(e)
         }), 500
 

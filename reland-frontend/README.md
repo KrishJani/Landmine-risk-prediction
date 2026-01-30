@@ -32,4 +32,4 @@ The app will open at `http://localhost:3000`
 
 - Node.js and npm installed
 - Valid Mapbox access token (free tier available)
-- Backend server running on `http://localhost:5001` (see Backend/README.md)
+- Backend server running on `http://localhost:5001` (see [reland-backend/README.md](../reland-backend/README.md))

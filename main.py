@@ -13,7 +13,8 @@ import pytorch_tabnet_irm.tab_model as irm_tab_model
 
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 
-from dataset import Event
+# Always use database-backed dataset (CSV static + DB dynamic overrides)
+from dataset_db import EventDB
 from reland import RELand
 from loss import RankLoss
 from utils import mean_reverse_height, mean_height, sigmoid
@@ -27,6 +28,48 @@ import pickle
 from typing import *
 
 import matplotlib.pyplot as plt
+
+def _get_db_url() -> str | None:
+    """
+    Select the correct database URL based on environment.
+
+    - Local: LOCAL_DATABASE_URL only (no fallback to production DB)
+    - Production: DATABASE_URL only
+    """
+    env = os.getenv('FLASK_ENV', os.getenv('ENVIRONMENT', 'local')).lower()
+    if env in ['production', 'prod']:
+        db_url = os.getenv('DATABASE_URL')
+        if not db_url:
+            raise ValueError(
+                "DATABASE_URL environment variable is required in production. "
+                "Please set it in your deployment platform."
+            )
+        return db_url
+    # Local mode: ONLY use LOCAL_DATABASE_URL (never touch production DB)
+    db_url = os.getenv('LOCAL_DATABASE_URL')
+    if not db_url:
+        raise ValueError(
+            "LOCAL_DATABASE_URL environment variable is required for local development. "
+            "Set it in your .env file to avoid accidentally connecting to production database."
+        )
+    return db_url
+
+def _make_dataset(train_municipios, val_municipio, subset, split):
+    """
+    Create the training/validation dataset using EventDB (database-backed).
+    
+    This ensures retraining always reflects:
+    - user_labels (label=1) in DB
+    - dist_old_mine values in DB
+    - All dynamic updates from the database
+    """
+    db_url = _get_db_url()
+    if not db_url:
+        raise ValueError(
+            "Database URL not set. "
+            "Set LOCAL_DATABASE_URL for local development or DATABASE_URL for production."
+        )
+    return EventDB(train_municipios, val_municipio, subset, split, db_url=db_url)
 
 def main(timestamp : str, train_val_stream : List):
     # TODO: ood bench
@@ -61,12 +104,12 @@ def main(timestamp : str, train_val_stream : List):
         else:
             print(f"Validate at {mpio}.")
 
-            train_data = Event(train_municipios, val_municipio, subset, split='train')
-            val_data = Event(train_municipios, val_municipio, subset, split='val')
+            train_data = _make_dataset(train_municipios, val_municipio, subset, split='train')
+            val_data = _make_dataset(train_municipios, val_municipio, subset, split='val')
             if args.municipio == 'puerto':
-                test_data = Event(train_municipios, 'PUERTO LIBERTADOR', subset, split='val')
+                test_data = _make_dataset(train_municipios, 'PUERTO LIBERTADOR', subset, split='val')
             elif args.municipio == 'murindo':
-                test_data = Event(train_municipios, 'MURINDÓ', subset, split='val')
+                test_data = _make_dataset(train_municipios, 'MURINDÓ', subset, split='val')
 
             feature_importance['features'] = val_data.features
 
@@ -97,6 +140,9 @@ def main(timestamp : str, train_val_stream : List):
                             param.requires_grad = False
                 else:
                     model = RELand(X_train.shape[1], args)
+            elif model_name == 'Lightweight':
+                # Very fast test model: same interface as others, trains in seconds for retrain/repredict testing
+                model = LogisticRegression(solver='saga', max_iter=20, random_state=737, C=1.0)
             elif model_name == 'LR' and objective == 'erm':
                 params = {'penalty':'l1','C':1.8791083362131904}
                 model = LogisticRegression(solver='saga', max_iter=1000, random_state=737, **params)
@@ -294,7 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--timestamp", help=r'unique experiment id, hint: datetime.now().strftime("%%m%%d%%Y%%H%%M%%S")') 
     parser.add_argument("--municipio", required=True, help='directory with train test split info')
     parser.add_argument("--subset", required=True, help='single | geo | full')
-    parser.add_argument("--model", required=True, help='TabCmpt | MLP | TabNet | LR | RF | SVM | LGBM')
+    parser.add_argument("--model", required=True, help='TabCmpt | MLP | TabNet | LR | RF | SVM | LGBM | Lightweight (fast test model)')
     parser.add_argument("--objective", required=True, help='irm | erm | pnorm')
     parser.add_argument("--n_step", type=int, help='number of decision blocks')
     parser.add_argument("--warm_start", help='directory for checkpoints for warm start')
@@ -343,6 +389,7 @@ if __name__ == "__main__":
     args.device = device
 
     config = vars(args)
+    os.makedirs(f"./experiments/{args.timestamp}", exist_ok=True)
     with open(f"./experiments/{args.timestamp}/config.json", 'w') as outfile:
         if config['device'].type == 'cuda':
             config['device'] = 'cuda'

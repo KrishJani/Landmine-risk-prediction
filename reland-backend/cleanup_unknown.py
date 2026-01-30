@@ -2,20 +2,11 @@
 Script to remove all entries with municipio='Unknown' from the database
 """
 import os
-from dotenv import load_dotenv
-from flask import Flask
+from app import create_app
 from models import db, Location, ConfirmedEvent, UserLabel
 
-# Load environment variables
-load_dotenv()
-
-# Create Flask app
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# Initialize database
-db.init_app(app)
+# Create Flask app using refactored structure
+app = create_app()
 
 def cleanup_unknown():
     """Remove all entries with municipio='Unknown'"""

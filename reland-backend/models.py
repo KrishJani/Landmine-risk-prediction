@@ -13,7 +13,7 @@ class Location(db.Model):
     """
     __tablename__ = 'locations'
     
-    id = db.Column(db.Integer, primary_key=True)
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     lat = db.Column(db.Float, nullable=False, index=True)
     lon = db.Column(db.Float, nullable=False, index=True)
     municipio = db.Column(db.String(100), nullable=False, index=True)
@@ -52,7 +52,10 @@ class Location(db.Model):
             'rainfall': self.rainfall,
             'temperature': self.temperature,
             'population_2012': self.population_2012,
-            'hist_mines': self.hist_mines
+            'hist_mines': self.hist_mines,
+            'dist_old_mine': self.dist_old_mine,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
 
@@ -62,7 +65,7 @@ class UserLabel(db.Model):
     """
     __tablename__ = 'user_labels'
     
-    id = db.Column(db.Integer, primary_key=True)
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     location_id = db.Column(db.Integer, db.ForeignKey('locations.id'), nullable=False, index=True)
     label = db.Column(db.Integer, nullable=False)  # 0 or 1
     notes = db.Column(db.Text)  # Optional user notes
@@ -92,7 +95,7 @@ class ConfirmedEvent(db.Model):
     """
     __tablename__ = 'confirmed_events'
     
-    id = db.Column(db.Integer, primary_key=True)
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     lat = db.Column(db.Float, nullable=False, index=True)
     lon = db.Column(db.Float, nullable=False, index=True)
     municipio = db.Column(db.String(100), nullable=False, index=True)
@@ -180,6 +183,8 @@ class TrainingJob(db.Model):
             'result': result_data,  # Parsed JSON instead of raw string
             'error_message': self.error_message,
             'ec2_instance_id': self.ec2_instance_id,
+            'model_name': self.model_name,
+            'municipio': self.municipio,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None

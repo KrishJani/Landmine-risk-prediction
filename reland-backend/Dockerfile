@@ -1,3 +1,5 @@
+# Build for linux/amd64 (x86_64) to match AWS App Runner platform
+# Note: Platform is specified in buildx command, not in FROM
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -28,15 +30,16 @@ COPY . .
 RUN mkdir -p /app/experiments
 
 # Make startup scripts executable
-RUN chmod +x /app/start.sh /app/run.py
+RUN chmod +x /app/run.py && \
+    chmod +x /app/minimal_health.py
 
 # Expose port (App Runner will set PORT env var)
-EXPOSE 8000
+EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+# Health check (more lenient for startup)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
 
-# Use Python wrapper to handle PORT env var
-CMD ["python3", "/app/run.py"]
+# CMD removed - App Runner uses Start command from service configuration
+# CMD ["python3", "/app/run.py"]
 

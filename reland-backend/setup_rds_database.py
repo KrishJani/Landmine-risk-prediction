@@ -1,19 +1,69 @@
+#!/usr/bin/env python3
 """
-Database initialization script
-Loads data from CSV files into the database
+Script to set up RDS database with the same schema and data as local database
+This script will:
+1. Create tables in RDS (if they don't exist)
+2. Load data from CSV files (same as init_database.py but for RDS)
 """
 import os
 import sys
 import pandas as pd
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Add parent directory to path to import app
 sys.path.insert(0, os.path.dirname(__file__))
 from models import db, Location, ConfirmedEvent
 
-# Import app from refactored structure
-from app import create_app
-app = create_app()
+def ensure_ssl_in_url(url):
+    """Ensure SSL is enabled in database URL"""
+    if 'sslmode' in url:
+        return url  # Already has SSL configured
+    if '?' not in url:
+        return url + '?sslmode=require'
+    else:
+        return url + '&sslmode=require'
+
+def setup_rds_database(rds_url):
+    """Set up RDS database with schema and data"""
+    from flask import Flask
+    from app import create_app
+    
+    # Ensure SSL is enabled for RDS
+    rds_url = ensure_ssl_in_url(rds_url)
+    
+    # Create app with RDS URL
+    os.environ['DATABASE_URL'] = rds_url
+    os.environ['FLASK_ENV'] = 'production'
+    
+    app = Flask(__name__)
+    app.config['SQLALCHEMY_DATABASE_URI'] = rds_url
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+    
+    with app.app_context():
+        print("="*50)
+        print("🗄️  Setting up RDS Database")
+        print("="*50)
+        
+        # Create tables
+        print("Creating database tables...")
+        db.create_all()
+        print("✓ Database tables created")
+        
+        # Load data from CSV files
+        locations_count = load_risk_predictions()
+        events_count = load_eo_events()
+        
+        print("="*50)
+        print(f"✓ RDS database setup complete!")
+        print(f"   Locations: {locations_count}")
+        print(f"   Confirmed Events: {events_count}")
+        print("="*50)
+
 
 def load_risk_predictions():
     """Load risk_map_predictions.csv into Location table"""
@@ -30,7 +80,7 @@ def load_risk_predictions():
     existing_count = Location.query.count()
     if existing_count > 0:
         print(f"⚠️  Database already has {existing_count} locations. Skipping import.")
-        print("   To reload, delete the database file and restart.")
+        print("   To reload, delete the data and restart.")
         return existing_count
     
     locations_added = 0
@@ -41,7 +91,6 @@ def load_risk_predictions():
             if pd.isna(risk_score):
                 risk_level = 'Low'
             else:
-                # Simple binning (can be improved)
                 if risk_score < 1e-30:
                     risk_level = 'Low'
                 elif risk_score < 1e-20:
@@ -136,22 +185,9 @@ def load_eo_events():
 
 
 if __name__ == '__main__':
-    with app.app_context():
-        print("="*50)
-        print("🗄️  Initializing RELand Database")
-        print("="*50)
-        
-        # Create tables
-        db.create_all()
-        print("✓ Database tables created")
-        
-        # Load data
-        locations_count = load_risk_predictions()
-        events_count = load_eo_events()
-        
-        print("="*50)
-        print(f"✓ Database initialization complete!")
-        print(f"   Locations: {locations_count}")
-        print(f"   Confirmed Events: {events_count}")
-        print("="*50)
-
+    import argparse
+    parser = argparse.ArgumentParser(description='Set up RDS database with schema and data')
+    parser.add_argument('--rds-url', type=str, help='RDS database URL (postgresql://user:pass@host:port/db)', required=True)
+    args = parser.parse_args()
+    
+    setup_rds_database(args.rds_url)

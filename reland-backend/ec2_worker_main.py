@@ -10,7 +10,8 @@ import sys
 import time
 import subprocess
 import json
-from datetime import datetime
+import argparse
+from datetime import datetime, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -22,15 +23,36 @@ if project_root not in sys.path:
 if reland_backend not in sys.path:
     sys.path.insert(0, reland_backend)
 
+# Load .env so LOCAL_DATABASE_URL (and DATABASE_URL) are set when run manually
+try:
+    from dotenv import load_dotenv
+    # Backend .env (primary); then project root .env if present
+    load_dotenv(os.path.join(reland_backend, '.env'))
+    load_dotenv(os.path.join(project_root, '.env'))
+except ImportError:
+    pass
+
 from models import TrainingJob, Location, ConfirmedEvent, db
 from sqlalchemy import text
 from flask import Flask
 
 # Database connection
-DATABASE_URL = os.getenv('DATABASE_URL')
-if not DATABASE_URL:
-    print("ERROR: DATABASE_URL not set")
-    sys.exit(1)
+# Match backend behavior:
+# - Production: DATABASE_URL (RDS) is required
+# - Local: LOCAL_DATABASE_URL is required (no fallback to production DB)
+env_name = os.getenv('FLASK_ENV', os.getenv('ENVIRONMENT', 'local')).lower()
+if env_name in ['production', 'prod']:
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL environment variable is required in production.")
+        sys.exit(1)
+else:
+    # Local mode: ONLY use LOCAL_DATABASE_URL (never touch production DB)
+    DATABASE_URL = os.getenv('LOCAL_DATABASE_URL')
+    if not DATABASE_URL:
+        print("ERROR: LOCAL_DATABASE_URL environment variable is required for local development.")
+        print("Set it in your .env file to avoid accidentally connecting to production database.")
+        sys.exit(1)
 
 # Create Flask app for database operations
 app = Flask(__name__)
@@ -56,9 +78,9 @@ def update_job_status(job_id, status, progress=None, message=None, error=None):
                 job.error_message = error
             
             if status == 'running' and not job.started_at:
-                job.started_at = datetime.utcnow()
+                job.started_at = datetime.now(timezone.utc)
             elif status in ['completed', 'failed']:
-                job.completed_at = datetime.utcnow()
+                job.completed_at = datetime.now(timezone.utc)
             
             db.session.commit()
             return True
@@ -94,10 +116,14 @@ def process_training_job(job):
                         db.session.commit()
                         column_exists = True
                     
-                    # Calculate distances
+                    # Calculate distances (load backend's DistanceCalculator by path so project-root utils.py doesn't shadow it)
                     import pandas as pd
-                    # utils.py is in project root
-                    from utils import distance_to_closest_point
+                    import importlib.util
+                    _dc_path = os.path.join(reland_backend, 'utils', 'distance_calculator.py')
+                    _spec = importlib.util.spec_from_file_location('distance_calculator', _dc_path)
+                    _dc = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_dc)
+                    DistanceCalculator = _dc.DistanceCalculator
                     
                     grid_data = {
                         'lat': [loc.lat for loc in all_locations],
@@ -111,7 +137,7 @@ def process_training_job(job):
                     }
                     poi_df = pd.DataFrame(poi_data)
                     
-                    distances = distance_to_closest_point(grid_df, poi_df)
+                    distances = DistanceCalculator.distance_to_closest_point(grid_df, poi_df)
                     
                     # Update locations
                     update_query = text("""
@@ -157,14 +183,15 @@ def process_training_job(job):
             
             update_job_status(job_id, 'running', progress=0.4, message="Training in progress...")
             
-            # Run training (this may take hours)
+            # Run training (this may take hours). Timeout configurable via TRAINING_TIMEOUT_SECONDS (default 6 hours).
+            training_timeout = int(os.environ.get('TRAINING_TIMEOUT_SECONDS', 21600))  # 6 hours default
             result = subprocess.run(
                 cmd,
                 cwd=script_dir,
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=7200  # 2 hour timeout
+                timeout=training_timeout
             )
             
             if result.returncode != 0:
@@ -214,27 +241,41 @@ def process_training_job(job):
             
             return True
         
-    except subprocess.TimeoutExpired:
-        update_job_status(
-            job_id, 
-            'failed', 
-            progress=1.0,
-            error="Training timed out after 2 hours"
-        )
-        return False
-    except Exception as e:
-        import traceback
-        error_msg = f"{str(e)}\n{traceback.format_exc()}"
-        update_job_status(
-            job_id, 
-            'failed', 
-            progress=1.0,
-            error=error_msg[:2000]
-        )
-        return False
+        except subprocess.TimeoutExpired:
+            training_timeout = int(os.environ.get('TRAINING_TIMEOUT_SECONDS', 21600))
+            hours = training_timeout // 3600
+            update_job_status(
+                job_id, 
+                'failed', 
+                progress=1.0,
+                error=f"Training timed out after {hours} hours (TRAINING_TIMEOUT_SECONDS={training_timeout}). Increase TRAINING_TIMEOUT_SECONDS or optimize training."
+            )
+            return False
+        except Exception as e:
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            update_job_status(
+                job_id, 
+                'failed', 
+                progress=1.0,
+                error=error_msg[:2000]
+            )
+            return False
 
-def main():
-    """Main worker loop"""
+def run_once(job_id: str) -> int:
+    """Process exactly one job and exit."""
+    with app.app_context():
+        job = TrainingJob.query.filter_by(id=job_id).first()
+        if not job:
+            print(f"ERROR: Job {job_id} not found")
+            return 2
+        print(f"Processing single job: {job.id}")
+        ok = process_training_job(job)
+        return 0 if ok else 1
+
+
+def main(poll: bool = True):
+    """Main worker loop (poll DB for pending jobs)."""
     print("RELand EC2 Worker starting...")
     print(f"Database: {DATABASE_URL[:50]}...")
     
@@ -246,6 +287,9 @@ def main():
     except:
         instance_id = None
     
+    if not poll:
+        return
+
     # Find pending jobs
     while True:
         try:
@@ -310,5 +354,14 @@ def main():
     print("RELand EC2 Worker stopped")
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="RELand training worker")
+    parser.add_argument('--job-id', help="Process a specific job id and exit (for local execution)")
+    args = parser.parse_args()
+
+    if args.job_id:
+        # Local mode: process single job and exit
+        raise SystemExit(run_once(args.job_id))
+
+    # Default behavior (EC2): poll for jobs until idle then terminate
+    main(poll=True)
 
