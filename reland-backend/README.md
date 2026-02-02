@@ -94,11 +94,14 @@ reland-backend/
 │   ├── recalculate.py         # Recalculate and predict
 │   └── municipality_borders.py # Municipality borders
 │
-└── utils/                      # Utility modules
+├── utils/                      # Utility modules
     ├── risk_calculator.py      # Risk level calculations
     ├── distance_calculator.py  # Distance calculations
     ├── model_finder.py         # Model file finding
     └── geocoding.py            # Geocoding service
+│
+├── docs/                       # Legacy deployment/troubleshooting notes
+└── scripts/                    # Deploy/diagnose helper scripts (.sh)
 ```
 
 ## 🔌 API Endpoints

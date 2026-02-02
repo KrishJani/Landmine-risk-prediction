@@ -76,6 +76,8 @@ def update_job_status(job_id, status, progress=None, message=None, error=None):
                 job.progress_message = message
             if error:
                 job.error_message = error
+            elif status == 'completed':
+                job.error_message = None  # Clear previous error on success
             
             if status == 'running' and not job.started_at:
                 job.started_at = datetime.now(timezone.utc)
@@ -88,6 +90,142 @@ def update_job_status(job_id, status, progress=None, message=None, error=None):
             print(f"ERROR updating job status: {str(e)}")
             db.session.rollback()
             return False
+
+
+def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
+    """
+    After training, run the same predict-per-DB-location flow as recalculate_and_predict
+    so every map point (including Cartagena) gets one prediction from the newly trained model.
+    Uses scaled features from nearest CSV row (no raw lon/lat overwrite).
+    """
+    import numpy as np
+    from pathlib import Path
+    from sklearn.neighbors import NearestNeighbors
+
+    with app.app_context():
+        job = TrainingJob.query.filter_by(id=job_id).first()
+        if not job:
+            return
+        all_locations = Location.query.all()
+        if not all_locations:
+            print("No locations in DB, skipping predict-per-DB-location")
+            return
+
+        train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']
+        val_municipio = 'ALL' if (job.municipio or 'blockCV') == 'blockCV' else (job.municipio or 'blockCV').upper()
+        subset = job.subset or 'full'
+        model_name = job.model_name or 'TabCmpt'
+        objective = job.objective or 'irm'
+
+        sys.path.insert(0, str(script_dir))
+        sys.path.insert(0, reland_backend)
+        from dataset_db import EventDB
+        from save_predictions_db import save_predictions_to_db_by_locations
+
+        all_data = EventDB(
+            train_municipios=train_municipios,
+            val_municipio=val_municipio,
+            subset=subset,
+            split='val',
+            db_url=DATABASE_URL
+        )
+        db_lon_lat = np.array([[loc.lon, loc.lat] for loc in all_locations], dtype=np.float64)
+        csv_lon_lat = np.column_stack([all_data.locations[:, 0], all_data.locations[:, 1]])
+        nn = NearestNeighbors(n_neighbors=1, metric='euclidean')
+        nn.fit(csv_lon_lat)
+        _, nearest_idx = nn.kneighbors(db_lon_lat)
+        nearest_idx = nearest_idx.flatten()
+        tabX_db = np.array(all_data.tabX[nearest_idx], dtype=np.float32)
+        n_db = len(all_locations)
+
+        class DBLocationDataset:
+            def __init__(self, tabX, locations_xy):
+                self.tabX = tabX
+                self.locations = locations_xy
+                self.y = np.zeros(len(tabX), dtype=np.float32)
+                self.hist_mine = np.zeros(len(tabX), dtype=np.float32)
+            def __len__(self):
+                return len(self.tabX)
+            def __getitem__(self, idx):
+                import torch
+                return (
+                    torch.tensor(self.tabX[idx], dtype=torch.float32),
+                    torch.tensor(self.y[idx], dtype=torch.float32),
+                    torch.tensor((self.locations[idx, 0], self.locations[idx, 1]), dtype=torch.float32),
+                    torch.tensor(self.hist_mine[idx], dtype=torch.float32),
+                )
+        db_dataset = DBLocationDataset(tabX_db, db_lon_lat)
+
+        exp_dir = Path(script_dir) / 'experiments' / timestamp
+        if model_name in ['TabCmpt', 'MLP']:
+            fold_paths = list(exp_dir.glob('*.pth'))
+        else:
+            fold_paths = list(exp_dir.glob('*.pkl'))
+        if not fold_paths:
+            print(f"No model files in {exp_dir}, skipping predict-per-DB-location")
+            return
+
+        if model_name in ['TabCmpt', 'MLP']:
+            import torch
+            from reland import RELand
+            from model import TabCmpt, MLP
+            from utils.model_finder import ModelFinder
+            detected_type = ModelFinder.detect_model_type(fold_paths[0])
+            actual_model_name = detected_type if detected_type in ['TabCmpt', 'MLP'] else model_name
+            class Args:
+                def __init__(self):
+                    self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    self.objective = objective
+                    self.model = actual_model_name
+                    self.n_step = 2
+                    self.timestamp = timestamp
+            args = Args()
+            all_preds = []
+            for fold_path in fold_paths:
+                model = RELand(all_data.tabX.shape[1], args)
+                state_dict = torch.load(str(fold_path), map_location=args.device)
+                model.model.load_state_dict(state_dict, strict=False)
+                pred_result = model.predict_proba(test_dataset=db_dataset)
+                pred = pred_result[4] if isinstance(pred_result, (tuple, list)) and len(pred_result) >= 5 else None
+                if pred is not None:
+                    all_preds.append(np.array(pred))
+            predictions = np.array(all_preds).mean(axis=0) if all_preds else None
+        elif model_name == 'TabNet':
+            import pytorch_tabnet.tab_model as erm_tab_model
+            import pytorch_tabnet_irm.tab_model as irm_tab_model
+            model = irm_tab_model.TabNetClassifier(seed=737, n_steps=2) if objective == 'irm' else erm_tab_model.TabNetClassifier(seed=737, n_steps=2)
+            model.load_model(str(fold_paths[0]))
+            predictions = model.predict_proba(tabX_db)[:, 1]
+            predictions = np.array(predictions)
+        else:
+            import pickle
+            all_preds = []
+            for path in fold_paths:
+                with open(path, 'rb') as f:
+                    m = pickle.load(f)
+                all_preds.append(m.predict_proba(tabX_db)[:, 1])
+            predictions = np.array(all_preds).mean(axis=0)
+
+        if predictions is None or len(predictions) != n_db:
+            print(f"Predictions length mismatch, skipping save")
+            return
+
+        global_mean = float(np.mean(predictions))
+        by_municipio = {}
+        for i, loc in enumerate(all_locations):
+            by_municipio.setdefault(loc.municipio, []).append(i)
+        for m, indices in by_municipio.items():
+            if len(indices) < 2:
+                continue
+            vals = predictions[indices]
+            if np.std(vals) < 1e-6:
+                blend = 0.5
+                for idx in indices:
+                    predictions[idx] = (1 - blend) * float(predictions[idx]) + blend * global_mean
+
+        save_predictions_to_db_by_locations(all_locations, predictions, db.session, Location, use_quantiles=True)
+        print("Saved predictions per DB location (post-train)")
+
 
 def process_training_job(job):
     """Process a training job"""
@@ -204,27 +342,42 @@ def process_training_job(job):
                 )
                 return False
             
-            # Save results
+            # Save results: run predict-per-DB-location (same flow as recalculate) so all map points including Cartagena get correct predictions
             update_job_status(job_id, 'running', progress=0.9, message="Saving results...")
-            
-            # Try to save predictions to database
+            predict_per_db_error = None
+            used_fallback = False
             try:
-                predicted_proba_path = os.path.join(script_dir, f'experiments/{timestamp}/predicted_proba.csv')
-                if os.path.exists(predicted_proba_path):
-                    import pandas as pd
-                    # save_predictions_db.py is in project root
-                    from save_predictions_db import save_predictions_to_db_orm
-                    predictions_df = pd.read_csv(predicted_proba_path)
-                    save_predictions_to_db_orm(predictions_df, db.session, Location)
+                _run_predict_per_db_location_after_train(job_id, timestamp, script_dir)
             except Exception as e:
-                print(f"Warning: Could not save predictions: {str(e)}")
+                import traceback
+                predict_per_db_error = f"{type(e).__name__}: {e}"
+                print(f"Warning: Predict-per-DB-location failed: {e}")
+                print(traceback.format_exc())
+                # Fallback: save from predicted_proba.csv if present (legacy behavior)
+                try:
+                    predicted_proba_path = os.path.join(script_dir, f'experiments/{timestamp}/predicted_proba.csv')
+                    if os.path.exists(predicted_proba_path):
+                        import pandas as pd
+                        from save_predictions_db import save_predictions_to_db_orm
+                        predictions_df = pd.read_csv(predicted_proba_path)
+                        save_predictions_to_db_orm(predictions_df, db.session, Location)
+                        used_fallback = True
+                        print("Saved predictions from predicted_proba.csv (fallback)")
+                except Exception as e2:
+                    print(f"Warning: Could not save predictions: {str(e2)}")
             
-            # Update job with results
+            # Update job with results; surface predict-per-DB failure so user can see it
             result_data = {
                 "timestamp": timestamp,
                 "experiment_dir": f"./experiments/{timestamp}/",
                 "return_code": result.returncode
             }
+            if predict_per_db_error:
+                result_data["predict_per_db_error"] = predict_per_db_error
+                result_data["predictions_from_fallback"] = used_fallback
+            final_message = "Training completed successfully"
+            if predict_per_db_error:
+                final_message = "Training completed; predictions saved from validation set only (predict-per-DB failed: " + predict_per_db_error[:200] + ")"
             
             # Get job again to update result
             job = TrainingJob.query.filter_by(id=job_id).first()
@@ -236,7 +389,7 @@ def process_training_job(job):
                 job_id, 
                 'completed', 
                 progress=1.0,
-                message="Training completed successfully"
+                message=final_message
             )
             
             return True

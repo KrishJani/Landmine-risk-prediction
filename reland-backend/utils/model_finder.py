@@ -4,7 +4,7 @@ Model finding utilities
 import os
 import glob
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from config import config
 
 
@@ -131,3 +131,34 @@ class ModelFinder:
         print(f"  ✓ Selected model: {model_path.name} from {timestamp} (type: {detected_type})")
         
         return model_path, timestamp, detected_type
+
+    @staticmethod
+    def find_all_fold_models_in_latest_experiment(model_name: str = 'TabCmpt', municipio: str = 'blockCV') -> Tuple[Optional[str], List[Path]]:
+        """
+        Find the latest experiment dir and return ALL fold model paths in it (for multi-fold averaging).
+        Reduces "all points = 1" in whole regions by averaging over folds.
+        
+        Returns:
+            (timestamp, list of model paths) or (None, []) if not found.
+        """
+        experiments_dir = config.EXPERIMENTS_DIR
+        cwd_experiments = Path(os.getcwd()) / 'experiments'
+        if not experiments_dir.exists() and cwd_experiments.exists():
+            experiments_dir = cwd_experiments
+        if not experiments_dir.exists():
+            return None, []
+        exp_dirs = [d for d in experiments_dir.iterdir() if d.is_dir()]
+        if not exp_dirs:
+            return None, []
+        exp_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        for exp_dir in exp_dirs:
+            timestamp = exp_dir.name
+            if model_name in ['TabCmpt', 'MLP']:
+                pth_files = list(exp_dir.glob('*.pth'))
+                if pth_files:
+                    return timestamp, pth_files
+            else:
+                pkl_files = list(exp_dir.glob('*.pkl'))
+                if pkl_files:
+                    return timestamp, pkl_files
+        return None, []

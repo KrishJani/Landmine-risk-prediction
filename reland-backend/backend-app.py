@@ -8,7 +8,7 @@ import requests
 import json
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timezone
 from math import isfinite
 from dotenv import load_dotenv
 from models import db, Location, UserLabel, ConfirmedEvent, TrainingJob
@@ -114,29 +114,21 @@ print("ℹ️  Using database-based async job queue (cost-optimized mode)", file
 def calculate_risk_levels(locations, score_column='risk_score'):
     """
     Calculate risk levels for a list of Location objects.
-    Uses quantile-based binning to categorize into Low/Medium/High.
+    Uses quantile-based binning: Low = bottom third, Medium = middle third, High = top third.
     """
     if not locations:
         return {}
-    
-    # Extract scores
     scores = []
     for loc in locations:
         score = getattr(loc, score_column, None)
         if score is not None and not (isinstance(score, float) and (score != score or not isfinite(score))):
             scores.append(score)
-    
     if not scores:
-        # No valid scores, assign all as Low
         return {loc.id: 'Low' for loc in locations}
-    
-    # Calculate quantiles
     scores_sorted = sorted(scores)
     n = len(scores_sorted)
     low_threshold = scores_sorted[n // 3] if n >= 3 else scores_sorted[0]
     high_threshold = scores_sorted[2 * n // 3] if n >= 3 else scores_sorted[-1]
-    
-    # Assign risk levels
     risk_levels = {}
     for loc in locations:
         score = getattr(loc, score_column, None)
@@ -148,7 +140,6 @@ def calculate_risk_levels(locations, score_column='risk_score'):
             risk_levels[loc.id] = 'Medium'
         else:
             risk_levels[loc.id] = 'High'
-    
     return risk_levels
 
 def get_color_for_risk_level(risk_level):
@@ -867,6 +858,30 @@ def _find_latest_model(model_name='TabCmpt', municipio='blockCV'):
     return None, None, None
 
 
+@app.route('/api/reset_predictions', methods=['POST'])
+def reset_predictions():
+    """
+    Clear risk_score and risk_level for all locations (set to NULL).
+    Use before testing retrain/repredict from a clean state.
+    """
+    try:
+        from sqlalchemy import text
+        total = Location.query.count()
+        db.session.execute(text(
+            "UPDATE locations SET risk_score = NULL, risk_level = NULL"
+        ))
+        db.session.commit()
+        return jsonify({
+            "message": "All predictions cleared. Run retrain then recalculate_and_predict to repopulate.",
+            "locations_updated": total
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/recalculate_and_predict', methods=['POST'])
 def recalculate_and_predict():
     """
@@ -1003,18 +1018,27 @@ def recalculate_and_predict():
         print(f"  Max distance: {distances.max():.4f} km")
         print(f"  Mean distance: {distances.mean():.4f} km")
         
-        # Find and load trained model
+        # Find and load trained model(s) - use multi-fold averaging when available
         print(f"  Looking for model: {model_name}, municipio: {municipio}", file=sys.stdout, flush=True)
-        model_path, timestamp, detected_model_type = _find_latest_model(model_name, municipio)
-        if not model_path:
+        try:
+            from utils.model_finder import ModelFinder
+            timestamp, fold_paths = ModelFinder.find_all_fold_models_in_latest_experiment(model_name, municipio)
+            if not fold_paths:
+                model_path, timestamp, detected_model_type = _find_latest_model(model_name, municipio)
+                fold_paths = [model_path] if model_path else []
+        except ImportError:
+            model_path, timestamp, detected_model_type = _find_latest_model(model_name, municipio)
+            fold_paths = [model_path] if model_path else []
+        if not fold_paths:
             return jsonify({
                 "message": "Distances recalculated successfully, but no trained model found for re-prediction.",
                 "updated_count": updated_count,
                 "confirmed_events_count": len(confirmed_events),
                 "note": f"Please train a {model_name} model first using the retrain endpoint."
             }), 200
-        
-        print(f"  Found model: {model_path} (detected type: {detected_model_type})", file=sys.stdout, flush=True)
+        model_path = fold_paths[0]
+        detected_model_type = model_name if model_name not in ['TabCmpt', 'MLP'] else _detect_model_type(model_path)
+        print(f"  Found {len(fold_paths)} fold model(s) (experiment: {timestamp})", file=sys.stdout, flush=True)
         
         # Load model and make predictions
         # This is a simplified version - you may need to adjust based on your model structure
@@ -1024,16 +1048,14 @@ def recalculate_and_predict():
             sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             
             from dataset_db import EventDB
-            from save_predictions_db import save_predictions_to_db_orm
+            from save_predictions_db import save_predictions_to_db_orm, save_predictions_to_db_by_locations
+            from sklearn.neighbors import NearestNeighbors
             
             # Load dataset with updated dist_old_mine
-            # For prediction, we need all locations, so use a dummy validation municipio
             print("  Loading dataset with updated features...")
-            train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']  # Default training set
-            val_municipio = municipio.upper() if municipio != 'blockCV' else 'BOLÍVAR'
+            train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']
+            val_municipio = 'ALL' if municipio == 'blockCV' else municipio.upper()
             
-            # Create dataset for all locations (we'll predict on all)
-            # Note: This is a simplified approach - you may need to adjust based on your data structure
             all_data = EventDB(
                 train_municipios=train_municipios,
                 val_municipio=val_municipio,
@@ -1041,6 +1063,35 @@ def recalculate_and_predict():
                 split='val',
                 db_url=DATABASE_URL
             )
+            
+            # Predict per DB location using nearest-CSV features (one prediction per map point)
+            db_lon_lat = np.array([[loc.lon, loc.lat] for loc in all_locations], dtype=np.float64)
+            csv_lon_lat = np.column_stack([all_data.locations[:, 0], all_data.locations[:, 1]])
+            nn_fit = NearestNeighbors(n_neighbors=1, metric='euclidean')
+            nn_fit.fit(csv_lon_lat)
+            _, nearest_idx = nn_fit.kneighbors(db_lon_lat)
+            nearest_idx = nearest_idx.flatten()
+            tabX_db = np.array(all_data.tabX[nearest_idx], dtype=np.float32)
+            # Keep scaled lon/lat from nearest CSV row (do NOT overwrite with raw DB coords) so model input matches training scale
+            n_db = len(all_locations)
+            print(f"  Built feature matrix for {n_db} DB locations (nearest-CSV row per location)", file=sys.stdout, flush=True)
+            
+            class DBLocationDataset:
+                def __init__(self, tabX, locations_xy):
+                    self.tabX = tabX
+                    self.locations = locations_xy
+                    self.y = np.zeros(len(tabX), dtype=np.float32)
+                    self.hist_mine = np.zeros(len(tabX), dtype=np.float32)
+                def __len__(self):
+                    return len(self.tabX)
+                def __getitem__(self, idx):
+                    return (
+                        torch.tensor(self.tabX[idx], dtype=torch.float32),
+                        torch.tensor(self.y[idx], dtype=torch.float32),
+                        torch.tensor((self.locations[idx, 0], self.locations[idx, 1]), dtype=torch.float32),
+                        torch.tensor(self.hist_mine[idx], dtype=torch.float32),
+                    )
+            db_dataset = DBLocationDataset(tabX_db, db_lon_lat)
             
             # Load model based on type
             if model_name in ['TabCmpt', 'MLP']:
@@ -1050,12 +1101,10 @@ def recalculate_and_predict():
                 from reland import RELand
                 from model import TabCmpt, MLP
                 
-                # Use detected model type if available, otherwise use requested type
                 actual_model_name = detected_model_type if detected_model_type in ['TabCmpt', 'MLP'] else model_name
                 if detected_model_type != model_name and detected_model_type in ['TabCmpt', 'MLP']:
                     print(f"  ⚠️  Warning: Found {detected_model_type} model but requested {model_name}. Using {detected_model_type}.", file=sys.stdout, flush=True)
                 
-                # Create args object with the actual model type
                 class Args:
                     def __init__(self, obj, ts, mname):
                         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -1072,23 +1121,28 @@ def recalculate_and_predict():
                         self.timestamp = ts
                 
                 args = Args(objective, timestamp, actual_model_name)
-                model = RELand(all_data.tabX.shape[1], args)
-                
-                # Load state dict with proper error handling
-                print(f"  Loading model from: {model_path}", file=sys.stdout, flush=True)
-                state_dict = torch.load(model_path, map_location=args.device)
-                # Use strict=False to allow partial loading (handles architecture differences)
-                missing_keys, unexpected_keys = model.model.load_state_dict(state_dict, strict=False)
-                if missing_keys:
-                    print(f"  ⚠️  Warning: Missing keys in model: {len(missing_keys)} keys", file=sys.stdout, flush=True)
-                if unexpected_keys:
-                    print(f"  ⚠️  Warning: Unexpected keys in model: {len(unexpected_keys)} keys", file=sys.stdout, flush=True)
-                print("  ✓ Model loaded successfully", file=sys.stdout, flush=True)
-                
-                # Make predictions
-                print("  Making predictions...", file=sys.stdout, flush=True)
-                predictions = model.predict_proba(test_dataset=all_data)
-                predictions = predictions[4]  # Get the probability array
+                all_preds = []
+                for i, fold_path in enumerate(fold_paths):
+                    model = RELand(all_data.tabX.shape[1], args)
+                    print(f"  Loading fold {i + 1}/{len(fold_paths)} from: {fold_path}", file=sys.stdout, flush=True)
+                    state_dict = torch.load(fold_path, map_location=args.device)
+                    missing_keys, unexpected_keys = model.model.load_state_dict(state_dict, strict=False)
+                    if (missing_keys or unexpected_keys) and i == 0:
+                        if missing_keys:
+                            print(f"  ⚠️  Warning: Missing keys in model: {len(missing_keys)} keys", file=sys.stdout, flush=True)
+                        if unexpected_keys:
+                            print(f"  ⚠️  Warning: Unexpected keys in model: {len(unexpected_keys)} keys", file=sys.stdout, flush=True)
+                    pred_result = model.predict_proba(test_dataset=db_dataset)
+                    if not isinstance(pred_result, (tuple, list)) or len(pred_result) < 5:
+                        raise ValueError(f"Unexpected predictions result from fold {i + 1}")
+                    pred = pred_result[4]
+                    if pred is None:
+                        raise ValueError(f"Predictions array is None for fold {i + 1}")
+                    all_preds.append(np.array(pred))
+                predictions = np.array(all_preds).mean(axis=0)
+                if len(predictions) != n_db:
+                    raise ValueError(f"Predictions length ({len(predictions)}) doesn't match DB locations ({n_db})")
+                print("  ✓ Predictions averaged over {0} fold(s) (per DB location)".format(len(fold_paths)), file=sys.stdout, flush=True)
                 
             elif model_name == 'TabNet':
                 import pytorch_tabnet.tab_model as erm_tab_model
@@ -1100,35 +1154,53 @@ def recalculate_and_predict():
                     model = erm_tab_model.TabNetClassifier(seed=737, n_steps=2)
                 
                 model.load_model(model_path)
-                predictions = model.predict_proba(all_data.tabX)[:, 1]
+                predictions = model.predict_proba(tabX_db)[:, 1]
+                predictions = np.array(predictions)
+                if len(predictions) != n_db:
+                    raise ValueError(f"Predictions length ({len(predictions)}) doesn't match DB locations ({n_db})")
                 
             else:
-                # For sklearn models (LR, RF, etc.)
+                # For sklearn models (Lightweight, LR, RF, etc.): average over all folds, predict per DB location
                 import pickle
-                with open(model_path, 'rb') as f:
-                    model = pickle.load(f)
-                predictions = model.predict_proba(all_data.tabX)[:, 1]
+                all_preds = []
+                for path in fold_paths:
+                    with open(path, 'rb') as f:
+                        model = pickle.load(f)
+                    all_preds.append(model.predict_proba(tabX_db)[:, 1])
+                predictions = np.array(all_preds).mean(axis=0)
+                if len(predictions) != n_db:
+                    raise ValueError(f"Predictions length ({len(predictions)}) doesn't match DB locations ({n_db})")
             
-            # Create predictions DataFrame
-            predictions_df = pd.DataFrame({
-                'LONGITUD_X': all_data.locations[:, 0],
-                'LATITUD_Y': all_data.locations[:, 1],
-                'predicted_proba': predictions
-            })
+            # Fix 3: Blend constant-municipality predictions with global mean so OOD municipalities don't show pure 0/1
+            global_mean = float(np.mean(predictions))
+            by_municipio = {}
+            for i, loc in enumerate(all_locations):
+                by_municipio.setdefault(loc.municipio, []).append(i)
+            constant_municipalities = []
+            for m, indices in by_municipio.items():
+                if len(indices) < 2:
+                    continue
+                vals = predictions[indices]
+                if np.std(vals) < 1e-6:
+                    constant_municipalities.append(m)
+                    blend = 0.5
+                    for idx in indices:
+                        predictions[idx] = (1 - blend) * float(predictions[idx]) + blend * global_mean
+            if constant_municipalities:
+                print("  Post-processed {0} constant municipalities (blended with global mean). Tip: retrain with municipio=map_included.".format(len(constant_municipalities)), file=sys.stdout, flush=True)
             
-            # Save predictions to database
-            print("  Saving predictions to database...")
-            from save_predictions_db import save_predictions_to_db_orm
-            save_predictions_to_db_orm(predictions_df, db.session, Location)
+            # Save predictions (one per DB location, quantile-based risk_level)
+            print("  Saving predictions to database (one per DB location)...", file=sys.stdout, flush=True)
+            save_predictions_to_db_by_locations(all_locations, predictions, db.session, Location, use_quantiles=True)
             
-            print(f"✓ Re-prediction completed successfully")
+            print(f"✓ Re-prediction completed successfully", file=sys.stdout, flush=True)
             
             return jsonify({
-                "message": "Distances recalculated and predictions updated successfully",
+                "message": "Distances recalculated and predictions updated successfully (one prediction per map point)",
                 "updated_count": updated_count,
                 "confirmed_events_count": len(confirmed_events),
-                "predictions_count": len(predictions_df),
-                "model_used": model_path
+                "predictions_count": n_db,
+                "model_used": str(model_path)
             }), 200
             
         except Exception as e:
@@ -1235,7 +1307,7 @@ def retrain_model():
                     "job_id": job_id
                 }), 500
         else:
-            # Local: Spawn local worker subprocess
+            # Local: Spawn local worker subprocess (log stdout/stderr so we can see failures)
             job.progress_message = "Job created, starting local worker..."
             db.session.commit()
             try:
@@ -1246,18 +1318,26 @@ def retrain_model():
                 if not os.path.exists(worker_script):
                     raise FileNotFoundError(f"Worker script not found: {worker_script}")
                 
-                # Spawn worker subprocess (non-blocking)
+                # Log worker output to file so predict-per-DB and other errors are visible
+                worker_log_dir = os.path.join(backend_dir, 'worker_logs')
+                os.makedirs(worker_log_dir, exist_ok=True)
+                worker_log_path = os.path.join(worker_log_dir, f'{job_id}.log')
+                worker_log_file = open(worker_log_path, 'w')
+                worker_log_file.write(f"Worker started for job {job_id} at {datetime.now(timezone.utc).isoformat()}\n")
+                worker_log_file.flush()
+                
+                # Spawn worker subprocess (non-blocking); stdout/stderr go to log file
                 subprocess.Popen(
                     [sys.executable, worker_script, '--job-id', job_id],
                     cwd=os.path.dirname(backend_dir),  # Project root
                     env=os.environ.copy(),  # Inherit environment (including LOCAL_DATABASE_URL)
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=worker_log_file,
+                    stderr=subprocess.STDOUT,
                     start_new_session=True  # Detach from parent
                 )
                 job.progress_message = "Local worker started"
                 db.session.commit()
-                print(f"  ✓ Local worker started for job {job_id}")
+                print(f"  ✓ Local worker started for job {job_id} (log: {worker_log_path})")
             except Exception as e:
                 print(f"  ⚠️  Error starting local worker: {str(e)}")
                 job.progress_message = f"Error starting local worker: {str(e)}"

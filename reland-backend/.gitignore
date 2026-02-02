@@ -1,5 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
 
-# Elastic Beanstalk Files
-.elasticbeanstalk/*
-!.elasticbeanstalk/*.cfg.yml
-!.elasticbeanstalk/*.global.yml
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+ml_venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+*.env.backup
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+local_db_backup.sql
+
+# Logs
+*.log
+logs/
+worker_logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+
+# Documentation (keep README.md)
+*.md
+!README.md
+
+# Tests
+tests/
+test_*.py
+*_test.py
+
+# Experiments (don't include in Docker image)
+experiments/
+
+# Node modules (if any)
+node_modules/
+
+# Local data files (should be in S3)
+*.csv
+!requirements.txt
+
+# Municipality data (large files)
+# Note: Municipality borders are now served as static GeoJSON from frontend/public/
+# The shapefile is converted to GeoJSON and included in the frontend build
+Muncipality Data/
+
+# Backup files
+*.bak
+*.backup
+
+# Docker
+.docker/
+
+# Temporary files
+*.tmp
+*.temp

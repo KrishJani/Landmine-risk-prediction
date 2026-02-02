@@ -214,7 +214,8 @@ class EventDB(Dataset):
                                 'nighttime_lights_2012', 'dist_pipeline','dist_powerline','dist_telecom','dist_mining',
                                 'forest_gain','forest_loss',
                                 '0.5km_hist_mines','2.0km_hist_mines','8.0km_hist_mines','16.0km_hist_mines','32.0km_hist_mines',
-                                'animal_inc','animal_dec'] 
+                                'animal_inc','animal_dec',
+                                'LONGITUD_X', 'LATITUD_Y'] 
 
             self.binary_cols = ['binary_hist_mine',
                                 'land_use_Agroforestal', 'land_use_Agrícola',
@@ -240,7 +241,8 @@ class EventDB(Dataset):
                                 'population_2012', 'coca_dist', 'soil_texture15_trans1', 'soil_texture15_trans2',
                                 'nighttime_lights_2012', 'dist_pipeline','dist_powerline','dist_telecom','dist_mining',
                                 'forest_gain','forest_loss',
-                                'animal_inc','animal_dec'] 
+                                'animal_inc','animal_dec',
+                                'LONGITUD_X', 'LATITUD_Y'] 
 
             self.binary_cols = ['land_use_Agroforestal', 'land_use_Agrícola',
                                 'land_use_Conservación de Suelos', 'land_use_Cuerpo de agua',

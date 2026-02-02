@@ -1,39 +1,50 @@
-# RELand - Landmine Risk Prediction System
+# RELand — Landmine Risk Prediction
 
-A machine learning system for predicting landmine risk in Colombia using geospatial data and historical events.
+ML system for predicting landmine risk in Colombia using geospatial data and historical events.
 
-## 🚀 Production Deployment
+## Project structure
 
-**For production deployment to AWS:**
+```
+Landmine-risk-prediction/
+├── main.py              # Training entry (models, train/val, save experiments)
+├── dataset_db.py        # Database-backed dataset (EventDB)
+├── save_predictions_db.py  # Save predictions to PostgreSQL
+├── model.py, reland.py, loss.py, utils.py   # ML components
+├── run_predictions.sh   # Run predictions with DB (set DATABASE_URL)
+├── run_reland.sh        # Example training run
+│
+├── docs/                # Project documentation
+│   ├── HANDOVER_GUIDE.md
+│   ├── DATA_ARCHITECTURE.md
+│   └── DEPLOYMENT_DETAILED_DOCUMENTATION.md
+├── scripts/             # Utilities (run from project root)
+│   ├── run_checks.py        # DB + CSV checks
+│   ├── diagnose_causes.py   # Diagnose uniform-risk causes
+│   ├── csv_labels_check.py  # Label counts per municipality
+│   └── deploy-helper.sh     # AWS deployment helper
+│
+├── reland-backend/      # Flask API (see reland-backend/README.md)
+├── reland-frontend/     # React map UI
+├── pytorch_tabnet_irm/  # TabNet IRM model code
+├── tree/                # Tree layout (visualization)
+└── OoD-Bench-main/      # Out-of-distribution bench (optional)
+```
 
-👉 **[DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md)** - Complete step-by-step deployment guide
+## Quick start
 
-**Cost Target:** ~$38.95/month (optimized, no Redis)
+- **Local backend:** See [reland-backend/README.md](reland-backend/README.md).
+- **Training:** Set `LOCAL_DATABASE_URL` (or `DATABASE_URL`), then e.g. `./run_predictions.sh` or `python main.py --help`.
+- **Scripts:** From project root: `python scripts/run_checks.py`, `python scripts/diagnose_causes.py`, `python scripts/csv_labels_check.py`.
 
-## 🏗️ Architecture
+## Architecture
 
-- **Frontend:** React app on S3 + CloudFront
-- **Backend:** Flask API on AWS App Runner
-- **Database:** PostgreSQL with PostGIS on RDS
-- **Training:** EC2 Spot instances (g4dn.xlarge GPU)
-- **Storage:** S3 for models and static files
+- **Frontend:** React on S3 + CloudFront  
+- **Backend:** Flask on AWS App Runner  
+- **Database:** PostgreSQL + PostGIS on RDS  
+- **Training:** EC2 Spot (g4dn.xlarge) or local worker  
 
-## 💰 Cost Breakdown
+See [docs/](docs/) for handover, data architecture, and deployment details.
 
-| Component | Cost/Month |
-|-----------|-----------|
-| Frontend (S3 + CloudFront) | $0.50 |
-| Backend (App Runner) | $15.00 |
-| Database (RDS) | $17.00 |
-| Model Training (EC2 Spot) | $5.20 |
-| Model Storage (S3) | $1.15 |
-| Artifacts (ECR) | $0.10 |
-| **TOTAL** | **~$38.95** |
+## License
 
-## 🔧 Local Development
-
-See [reland-backend/README.md](./reland-backend/README.md) for local setup.
-
-## 📝 License
-
-See [LICENSE](./LICENSE) file.
+See [LICENSE](LICENSE).

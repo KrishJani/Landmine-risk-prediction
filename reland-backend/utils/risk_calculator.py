@@ -20,36 +20,21 @@ class RiskCalculator:
     def calculate_risk_levels(locations: List[Location], score_column: str = 'risk_score') -> Dict[int, str]:
         """
         Calculate risk levels for a list of Location objects.
-        Uses quantile-based binning to categorize into Low/Medium/High.
-        
-        Args:
-            locations: List of Location objects
-            score_column: Column name to use for risk score
-            
-        Returns:
-            Dictionary mapping location_id to risk level
+        Uses quantile-based binning: Low = bottom third, Medium = middle third, High = top third.
         """
         if not locations:
             return {}
-        
-        # Extract valid scores
         scores = []
         for loc in locations:
             score = getattr(loc, score_column, None)
             if score is not None and not (isinstance(score, float) and (score != score or not isfinite(score))):
                 scores.append(score)
-        
         if not scores:
-            # No valid scores, assign all as Low
             return {loc.id: 'Low' for loc in locations}
-        
-        # Calculate quantiles
         scores_sorted = sorted(scores)
         n = len(scores_sorted)
         low_threshold = scores_sorted[n // 3] if n >= 3 else scores_sorted[0]
         high_threshold = scores_sorted[2 * n // 3] if n >= 3 else scores_sorted[-1]
-        
-        # Assign risk levels
         risk_levels = {}
         for loc in locations:
             score = getattr(loc, score_column, None)
@@ -61,7 +46,6 @@ class RiskCalculator:
                 risk_levels[loc.id] = 'Medium'
             else:
                 risk_levels[loc.id] = 'High'
-        
         return risk_levels
     
     @staticmethod

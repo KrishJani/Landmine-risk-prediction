@@ -142,3 +142,58 @@ def save_predictions_to_db_orm(predictions_df, db_session, Location):
     print(f"✓ Successfully updated {updated_count} locations in database")
     return updated_count
 
+
+def save_predictions_to_db_by_locations(db_locations, predictions_array, db_session, Location, use_quantiles=True):
+    """
+    Assign one prediction per DB location (by index), then set risk_level using
+    quantile-based binning so stored levels match map display.
+    Use when predictions_array is already one-to-one with db_locations (e.g. predicted per DB location).
+
+    Args:
+        db_locations: list of Location ORM objects (same order as predictions_array)
+        predictions_array: 1D array of predicted probability, length = len(db_locations)
+        db_session: SQLAlchemy session
+        Location: Location model class (unused, for API consistency)
+        use_quantiles: if True, set risk_level by quantiles (Low/Medium/High = bottom/mid/top third)
+
+    Returns:
+        int: Number of locations updated
+    """
+    n = len(db_locations)
+    if n != len(predictions_array):
+        raise ValueError(
+            f"Length mismatch: {n} locations vs {len(predictions_array)} predictions"
+        )
+    predictions_array = np.asarray(predictions_array, dtype=np.float64)
+    valid = np.isfinite(predictions_array)
+    if use_quantiles and np.sum(valid) >= 3:
+        scores_sorted = np.sort(predictions_array[valid])
+        nn = len(scores_sorted)
+        q_low = scores_sorted[nn // 3]
+        q_high = scores_sorted[2 * nn // 3]
+    else:
+        q_low, q_high = 1.0 / 3.0, 2.0 / 3.0
+
+    for i, loc in enumerate(db_locations):
+        proba = float(predictions_array[i])
+        loc.risk_score = proba if np.isfinite(proba) else None
+        if loc.risk_score is None:
+            loc.risk_level = 'Low'
+        elif use_quantiles and np.sum(valid) >= 3:
+            if proba <= q_low:
+                loc.risk_level = 'Low'
+            elif proba <= q_high:
+                loc.risk_level = 'Medium'
+            else:
+                loc.risk_level = 'High'
+        else:
+            if proba < 0.33:
+                loc.risk_level = 'Low'
+            elif proba < 0.67:
+                loc.risk_level = 'Medium'
+            else:
+                loc.risk_level = 'High'
+    db_session.commit()
+    print(f"✓ Successfully updated {n} locations in database (by location, quantile-based risk_level)")
+    return n
+

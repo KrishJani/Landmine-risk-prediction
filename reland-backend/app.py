@@ -71,10 +71,12 @@ def create_app(config_class=None):
                 "/api/confirmed_events": "GET/POST/PUT/DELETE - Manage confirmed events",
                 "/api/locations": "PUT/POST - Update location risk scores",
                 "/api/recalculate_and_predict": "POST - Recalculate distances and re-predict",
+                "/api/reset_predictions": "POST - Clear risk scores (for clean testing)",
                 "/api/retrain_model": "POST - Retrain model",
                 "/api/job_status/<job_id>": "GET - Get training job status",
                 "/api/jobs": "GET - List training jobs",
-                "/api/last_trained_model": "GET - Last trained model (when and name)"
+                "/api/last_trained_model": "GET - Last trained model (when and name)",
+                "/api/export_predictions": "GET - Download prediction data as Excel (.xlsx) or GeoJSON (.geojson?format=geojson)"
             }
         })
     

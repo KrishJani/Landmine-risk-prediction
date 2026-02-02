@@ -1,0 +1,57 @@
+# Docker Compose for Local Development
+# This allows running the backend in Docker locally with the same image as production
+# Usage: docker-compose up
+
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reland-backend-local
+    ports:
+      - "5001:5001"
+    environment:
+      # Local development environment variables
+      - FLASK_ENV=local
+      - ENVIRONMENT=local
+      - DATABASE_URL=postgresql://reland_user:reland_password@host.docker.internal:5432/reland_db
+      - PORT=5001
+      - DEBUG=True
+      # Optional: Add your Google API key here or use .env file
+      # - GOOGLE_GEOCODING_API_KEY=your_key_here
+    volumes:
+      # Mount local experiments directory if needed
+      - ./experiments:/app/experiments
+    # Use host network mode to access localhost PostgreSQL
+    # Alternative: Use a separate PostgreSQL service in docker-compose
+    network_mode: "host"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Uncomment to run PostgreSQL in Docker
+  # postgres:
+  #   image: postgres:15
+  #   container_name: reland-postgres-local
+  #   environment:
+  #     - POSTGRES_DB=reland_db
+  #     - POSTGRES_USER=reland_user
+  #     - POSTGRES_PASSWORD=reland_password
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U reland_user"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+# volumes:
+#   postgres_data:

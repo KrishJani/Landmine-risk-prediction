@@ -18,5 +18,6 @@ from . import (
     locations,
     training,
     municipality_borders,
-    recalculate
+    recalculate,
+    export
 )

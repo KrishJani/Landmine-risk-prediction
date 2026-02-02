@@ -144,8 +144,12 @@ function App() {
   // Loading state for recalculation and retraining
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [isRetraining, setIsRetraining] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
   // Model type for retrain/repredict: 'TabCmpt' (full) or 'Lightweight' (fast test)
   const [retrainModelType, setRetrainModelType] = useState('TabCmpt');
+  // Train/val split: 'map_included' = all map municipalities in training (recommended for variation); 'blockCV' = original 15 municipalities
+  const [retrainMunicipio, setRetrainMunicipio] = useState('map_included');
   
   // Legend visibility state
   const [showLegend, setShowLegend] = useState(true);
@@ -718,7 +722,7 @@ function App() {
       },
       body: JSON.stringify({
         model: retrainModelType,
-        municipio: 'blockCV',
+        municipio: retrainMunicipio,
         subset: 'full',
         objective: 'irm'
       })
@@ -743,6 +747,100 @@ function App() {
       });
   };
 
+  // Build export URL with optional areas[] and format
+  const getExportUrl = (format) => {
+    const params = new URLSearchParams();
+    if (selectedAreas.length > 0) {
+      selectedAreas.forEach(area => params.append('areas[]', area));
+    }
+    if (format === 'geojson') params.set('format', 'geojson');
+    return `${API_BASE_URL}/api/export_predictions${params.toString() ? '?' + params.toString() : ''}`;
+  };
+
+  // Handler for download prediction data as Excel
+  const handleDownloadExcel = () => {
+    setIsDownloading(true);
+    fetch(getExportUrl('excel'))
+      .then(res => {
+        if (!res.ok) {
+          return res.json().then(data => {
+            throw new Error(data.error || `Download failed (${res.status})`);
+          });
+        }
+        return res.blob();
+      })
+      .then(blob => {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `RELand_predictions_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        a.remove();
+      })
+      .catch(err => {
+        console.error('Export error:', err);
+        alert(`Download failed: ${err.message || 'Unknown error'}`);
+      })
+      .finally(() => setIsDownloading(false));
+  };
+
+  // Handler for download prediction data as GeoJSON (for QGIS, ArcGIS, etc.)
+  const handleDownloadGeoJSON = () => {
+    setIsDownloading(true);
+    fetch(getExportUrl('geojson'))
+      .then(res => {
+        if (!res.ok) {
+          return res.json().then(data => {
+            throw new Error(data.error || `Download failed (${res.status})`);
+          });
+        }
+        return res.blob();
+      })
+      .then(blob => {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `RELand_predictions_${new Date().toISOString().slice(0, 10)}.geojson`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        a.remove();
+      })
+      .catch(err => {
+        console.error('GeoJSON export error:', err);
+        alert(`Download failed: ${err.message || 'Unknown error'}`);
+      })
+      .finally(() => setIsDownloading(false));
+  };
+
+  // Handler for reset predictions (clear heatmap for clean testing)
+  const handleResetPredictions = () => {
+    if (!window.confirm('Clear all risk scores and risk levels from the map? Use this before testing retrain/repredict from a clean state. Continue?')) {
+      return;
+    }
+    setIsResetting(true);
+    fetch(`${API_BASE_URL}/api/reset_predictions`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+      .then(res => res.json())
+      .then(data => {
+        setIsResetting(false);
+        if (data.error) {
+          alert(`Error: ${data.error}`);
+        } else {
+          alert(`${data.message}\nLocations updated: ${data.locations_updated ?? 0}`);
+          const currentAreas = [...selectedAreas];
+          setSelectedAreas([]);
+          setTimeout(() => setSelectedAreas(currentAreas), 100);
+        }
+      })
+      .catch(err => {
+        setIsResetting(false);
+        console.error('Error resetting:', err);
+        alert('Error resetting predictions. Please try again.');
+      });
+  };
+
   // Handler for retrain model (async job submission)
   const handleRetrainModel = () => {
     const isLightweight = retrainModelType === 'Lightweight';
@@ -762,7 +860,7 @@ function App() {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        municipio: 'blockCV',
+        municipio: retrainMunicipio,
         subset: 'full',
         model: retrainModelType,
         objective: 'irm',
@@ -992,8 +1090,7 @@ function App() {
     const map = mapRef.current.getMap();
     if (!map || !map.isStyleLoaded()) return;
     
-    // Wait a bit for layers to be added/updated
-    const timeoutId = setTimeout(() => {
+    const reorderLayers = () => {
       try {
         const predictionLayer = map.getLayer('prediction-points');
         const borderFillLayer = map.getLayer('municipality-borders-fill');
@@ -1028,7 +1125,7 @@ function App() {
           }
         }
         
-        // STEP 2: Ensure borders come after predictions
+        // STEP 2: Ensure borders ALWAYS render on top of predictions
         // Re-check indices after potential moves in STEP 1
         const currentLayers = map.getStyle().layers;
         const currentPredictionIndex = predictionLayer ? currentLayers.findIndex(l => l.id === 'prediction-points') : -1;
@@ -1036,8 +1133,7 @@ function App() {
         
         if (predictionLayer && borderFillLayer && currentPredictionIndex >= 0 && currentBorderFillIndex >= 0) {
           if (currentBorderFillIndex < currentPredictionIndex) {
-            // Border fill is before predictions, move it after
-            // Find what comes after predictions
+            // Border fill is before predictions (borders would be underneath) - move border fill after predictions
             for (let i = currentPredictionIndex + 1; i < currentLayers.length; i++) {
               const nextLayerId = currentLayers[i].id;
               if (nextLayerId !== 'municipality-borders-fill' && nextLayerId !== 'municipality-borders-outline') {
@@ -1045,6 +1141,9 @@ function App() {
                 break;
               }
             }
+          } else if (currentBorderFillIndex > currentPredictionIndex) {
+            // Predictions are above borders - move prediction layer UNDER border fill so borders render on top
+            map.moveLayer('prediction-points', 'municipality-borders-fill');
           }
         }
         
@@ -1118,9 +1217,16 @@ function App() {
         // Silently fail - layers might not exist yet or already be in correct order
         console.debug('Layer reordering:', err);
       }
-    }, 200); // Delay to ensure layers are fully added before reordering
+    };
     
-    return () => clearTimeout(timeoutId);
+    // Run reorder soon and again later to catch async layer additions (borders/predictions loading at different times)
+    const timeoutId1 = setTimeout(reorderLayers, 200);
+    const timeoutId2 = setTimeout(reorderLayers, 600);
+    
+    return () => {
+      clearTimeout(timeoutId1);
+      clearTimeout(timeoutId2);
+    };
   }, [showPrediction, showConfirmedEvents, predictionData, municipalityBorders, confirmedEvents, mapReady, mapStyle]);
 
   // Function to load custom icons - reusable for map load and style changes
@@ -1504,6 +1610,59 @@ function App() {
               )}
             </div>
           )}
+          <div style={{ marginTop: '12px' }}>
+            <div style={{ fontSize: '12px', fontWeight: '600', color: '#495057', marginBottom: '8px' }}>
+              Export data
+            </div>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <button
+                onClick={handleDownloadExcel}
+                disabled={isDownloading}
+                style={{
+                  flex: '1',
+                  minWidth: '100px',
+                  padding: '10px 12px',
+                  backgroundColor: isDownloading ? '#adb5bd' : '#0d6efd',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: isDownloading ? 'not-allowed' : 'pointer',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  opacity: isDownloading ? 0.7 : 1
+                }}
+              >
+                {isDownloading ? '…' : 'Excel'}
+              </button>
+              <button
+                onClick={handleDownloadGeoJSON}
+                disabled={isDownloading}
+                style={{
+                  flex: '1',
+                  minWidth: '100px',
+                  padding: '10px 12px',
+                  backgroundColor: isDownloading ? '#adb5bd' : '#198754',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: isDownloading ? 'not-allowed' : 'pointer',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  opacity: isDownloading ? 0.7 : 1
+                }}
+              >
+                {isDownloading ? '…' : 'GeoJSON'}
+              </button>
+            </div>
+            <div style={{ fontSize: '11px', color: '#6c757d', marginTop: '6px' }}>
+              {selectedAreas.length > 0
+                ? `Current areas (${selectedAreas.length}) + confirmed events`
+                : 'All predictions + confirmed events'}
+            </div>
+            <div style={{ fontSize: '10px', color: '#868e96', marginTop: '4px', lineHeight: 1.3 }}>
+              Use GeoJSON in QGIS, ArcGIS, or other GIS tools.
+            </div>
+          </div>
         </div>
 
         <div className="control-group">
@@ -1623,6 +1782,26 @@ function App() {
         <div className="control-group">
           <strong>Update Predictions</strong>
           <button 
+            onClick={handleResetPredictions}
+            disabled={isResetting}
+            style={{
+              width: '100%',
+              padding: '8px',
+              marginTop: '5px',
+              backgroundColor: isResetting ? '#6c757d' : '#6c757d',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: isResetting ? 'not-allowed' : 'pointer',
+              opacity: isResetting ? 0.6 : 1
+            }}
+          >
+            {isResetting ? 'Resetting...' : 'Reset predictions (clear map)'}
+          </button>
+          <div style={{ fontSize: '11px', color: '#666', marginTop: '3px', fontStyle: 'italic' }}>
+            Clear risk scores for clean testing
+          </div>
+          <button 
             onClick={handleRecalculateAndPredict}
             disabled={isRecalculating}
             style={{
@@ -1647,6 +1826,17 @@ function App() {
           }}>
             Updates distances and re-predicts with existing model
           </div>
+          <label style={{ display: 'block', marginTop: '10px', fontSize: '12px' }}>
+            Train/val split:
+          </label>
+          <select 
+            value={retrainMunicipio} 
+            onChange={e => setRetrainMunicipio(e.target.value)}
+            style={{ width: '100%', padding: '6px', marginTop: '4px', fontSize: '12px' }}
+          >
+            <option value="map_included">map_included (all map areas in training, recommended)</option>
+            <option value="blockCV">blockCV (original 15 municipalities)</option>
+          </select>
           <label style={{ display: 'block', marginTop: '10px', fontSize: '12px' }}>
             Model for retrain/repredict:
           </label>

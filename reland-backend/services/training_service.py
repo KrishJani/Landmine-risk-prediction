@@ -110,18 +110,24 @@ class TrainingService:
             if not os.path.exists(worker_script):
                 raise FileNotFoundError(f"Worker script not found: {worker_script}")
             
-            # Spawn worker subprocess (non-blocking)
-            # Use --job-id to process just this job and exit
+            # Log worker output so predict-per-DB and other errors are visible
+            worker_log_dir = os.path.join(backend_dir, 'worker_logs')
+            os.makedirs(worker_log_dir, exist_ok=True)
+            worker_log_path = os.path.join(worker_log_dir, f'{job_id}.log')
+            worker_log_file = open(worker_log_path, 'w')
+            from datetime import datetime, timezone
+            worker_log_file.write(f"Worker started for job {job_id} at {datetime.now(timezone.utc).isoformat()}\n")
+            worker_log_file.flush()
             import sys
             subprocess.Popen(
                 [sys.executable, worker_script, '--job-id', job_id],
                 cwd=os.path.dirname(backend_dir),  # Project root
                 env=os.environ.copy(),  # Inherit environment (including LOCAL_DATABASE_URL)
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=worker_log_file,
+                stderr=subprocess.STDOUT,
                 start_new_session=True  # Detach from parent
             )
-            print(f"  ✓ Local worker started for job {job_id}")
+            print(f"  ✓ Local worker started for job {job_id} (log: {worker_log_path})")
         except Exception as e:
             print(f"  ⚠️  Error starting local worker: {str(e)}")
             raise

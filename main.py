@@ -141,8 +141,8 @@ def main(timestamp : str, train_val_stream : List):
                 else:
                     model = RELand(X_train.shape[1], args)
             elif model_name == 'Lightweight':
-                # Very fast test model: same interface as others, trains in seconds for retrain/repredict testing
-                model = LogisticRegression(solver='saga', max_iter=20, random_state=737, C=1.0)
+                # Stronger regularization (C=0.1) so model generalizes to OOD municipalities instead of collapsing to 0/1
+                model = LogisticRegression(solver='saga', max_iter=20, random_state=737, C=0.1)
             elif model_name == 'LR' and objective == 'erm':
                 params = {'penalty':'l1','C':1.8791083362131904}
                 model = LogisticRegression(solver='saga', max_iter=1000, random_state=737, **params)
