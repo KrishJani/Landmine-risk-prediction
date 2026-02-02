@@ -265,6 +265,13 @@ def get_map_data():
         
         risk_levels = calculate_risk_levels(locations, score_to_use)
         
+        # User labels: labeled points show correct color/risk (0 = Low, 1 = High)
+        location_ids = [loc.id for loc in locations]
+        labels_by_location = {
+            ul.location_id: ul.label
+            for ul in UserLabel.query.filter(UserLabel.location_id.in_(location_ids)).all()
+        }
+        
         # Debug: Check actual risk score values
         all_scores = [getattr(loc, score_to_use, None) or loc.risk_score_lr for loc in locations if getattr(loc, score_to_use, None) or loc.risk_score_lr]
         valid_scores = [s for s in all_scores if s is not None and isfinite(s)]
@@ -283,12 +290,20 @@ def get_map_data():
         
         risk_points = []
         for location in locations:
-            risk_level = risk_levels.get(location.id, 'Low')
-            risk_score = getattr(location, score_to_use, None) or location.risk_score_lr
-            
-            # Ensure we have a valid numeric score
-            if risk_score is None or not isfinite(risk_score):
-                risk_score = 0.0
+            user_label = labels_by_location.get(location.id)
+            if user_label is not None:
+                if user_label == 0:
+                    risk_level = 'Low'
+                    risk_score = 0.0
+                else:
+                    risk_level = 'High'
+                    risk_score = 1.0
+            else:
+                risk_level = risk_levels.get(location.id, 'Low')
+                risk_score = getattr(location, score_to_use, None) or location.risk_score_lr
+                if risk_score is None or not isfinite(risk_score):
+                    risk_score = 0.0
+                risk_score = float(risk_score)
             
             risk_points.append({
                 'LATITUD_Y': location.lat,
@@ -856,30 +871,6 @@ def _find_latest_model(model_name='TabCmpt', municipio='blockCV'):
                 return pkl_files[0], timestamp, model_name
     
     return None, None, None
-
-
-@app.route('/api/reset_predictions', methods=['POST'])
-def reset_predictions():
-    """
-    Clear risk_score and risk_level for all locations (set to NULL).
-    Use before testing retrain/repredict from a clean state.
-    """
-    try:
-        from sqlalchemy import text
-        total = Location.query.count()
-        db.session.execute(text(
-            "UPDATE locations SET risk_score = NULL, risk_level = NULL"
-        ))
-        db.session.commit()
-        return jsonify({
-            "message": "All predictions cleared. Run retrain then recalculate_and_predict to repopulate.",
-            "locations_updated": total
-        }), 200
-    except Exception as e:
-        db.session.rollback()
-        import traceback
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/recalculate_and_predict', methods=['POST'])

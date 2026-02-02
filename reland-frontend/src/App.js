@@ -113,6 +113,7 @@ function App() {
   
   // Label and event management state
   const [userLabels, setUserLabels] = useState([]);
+  const deletedLabelLocationIdsRef = useRef(new Set()); // Keep deleted-label points hidden after refetch (ref to avoid refetch on delete)
   const [confirmedEvents, setConfirmedEvents] = useState([]);
   const [selectedPoint, setSelectedPoint] = useState(null); // Point clicked for labeling
   const [showLabelDialog, setShowLabelDialog] = useState(false);
@@ -144,7 +145,6 @@ function App() {
   // Loading state for recalculation and retraining
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [isRetraining, setIsRetraining] = useState(false);
-  const [isResetting, setIsResetting] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   // Model type for retrain/repredict: 'TabCmpt' (full) or 'Lightweight' (fast test)
   const [retrainModelType, setRetrainModelType] = useState('TabCmpt');
@@ -153,6 +153,8 @@ function App() {
   
   // Legend visibility state
   const [showLegend, setShowLegend] = useState(true);
+  // More actions (Reset / Recalculate / Retrain) - collapsed by default
+  const [showMoreActions, setShowMoreActions] = useState(false);
 
   
   // --- Data Fetching (Side Effects) ---
@@ -292,7 +294,17 @@ function App() {
         };
 
         const heatmapPoints = data.risk_heatmap_points || data.prediction_points || [];
-        const heatmapGeoJSON = toGeoJSON(normalizeRiskScores(heatmapPoints));
+        let heatmapGeoJSON = toGeoJSON(normalizeRiskScores(heatmapPoints));
+        // Keep points whose label was deleted this session hidden (they reappear from backend otherwise)
+        const deletedIds = deletedLabelLocationIdsRef.current;
+        if (heatmapGeoJSON && heatmapGeoJSON.features && deletedIds.size > 0) {
+          heatmapGeoJSON = {
+            ...heatmapGeoJSON,
+            features: heatmapGeoJSON.features.filter(
+              f => !f.properties || !deletedIds.has(f.properties.location_id)
+            )
+          };
+        }
 
         // 1. Set predictions first (rendered first / bottom layer)
         setPredictionData(heatmapGeoJSON);
@@ -709,30 +721,6 @@ function App() {
       .finally(() => setIsDownloading(false));
   };
 
-  // Handler for reset predictions (clear heatmap for clean testing)
-  const handleResetPredictions = () => {
-    if (!window.confirm('Clear all risk scores and risk levels from the map? Use this before testing retrain/repredict from a clean state. Continue?')) {
-      return;
-    }
-    setIsResetting(true);
-    fetch(`${API_BASE_URL}/api/reset_predictions`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-      .then(res => res.json())
-      .then(data => {
-        setIsResetting(false);
-        if (data.error) {
-          alert(`Error: ${data.error}`);
-        } else {
-          alert(`${data.message}\nLocations updated: ${data.locations_updated ?? 0}`);
-          loadPredictionsAndBorders();
-        }
-      })
-      .catch(err => {
-        setIsResetting(false);
-        console.error('Error resetting:', err);
-        alert('Error resetting predictions. Please try again.');
-      });
-  };
-
   // Handler for retrain model (async job submission)
   const handleRetrainModel = () => {
     const isLightweight = retrainModelType === 'Lightweight';
@@ -867,7 +855,6 @@ function App() {
         } else {
           // Update local state
           const existingIndex = userLabels.findIndex(l => l.location_id === data.location_id);
-          const isNewLabel = existingIndex < 0;
           if (existingIndex >= 0) {
             const updated = [...userLabels];
             updated[existingIndex] = data;
@@ -877,8 +864,8 @@ function App() {
           }
 
           fetchConfirmedEvents();
-          // Only refetch map data when adding a new label (so new point appears); skip refetch on edit
-          if (isNewLabel) loadPredictionsAndBorders();
+          deletedLabelLocationIdsRef.current.delete(data.location_id); // If user re-labels a previously deleted point, show it again
+          loadPredictionsAndBorders(); // Refetch so color/risk updates for both add and edit (0 → low, 1 → high)
           setShowLabelDialog(false);
           setSelectedPoint(null);
           setLabelForm({ label: null, notes: '', manualLat: '', manualLon: '', useManualCoords: false });
@@ -908,6 +895,7 @@ function App() {
         } else {
           const deletedLocationId = selectedPoint.location_id;
           setUserLabels(userLabels.filter(l => l.location_id !== deletedLocationId));
+          deletedLabelLocationIdsRef.current.add(deletedLocationId); // Keep this point hidden on next refetch
           setPredictionData(prev => {
             if (!prev || !prev.features) return prev;
             const filtered = prev.features.filter(f => !f.properties || f.properties.location_id !== deletedLocationId);
@@ -1677,26 +1665,6 @@ function App() {
         <div className="control-group">
           <strong>Update Predictions</strong>
           <button 
-            onClick={handleResetPredictions}
-            disabled={isResetting}
-            style={{
-              width: '100%',
-              padding: '8px',
-              marginTop: '5px',
-              backgroundColor: isResetting ? '#6c757d' : '#6c757d',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isResetting ? 'not-allowed' : 'pointer',
-              opacity: isResetting ? 0.6 : 1
-            }}
-          >
-            {isResetting ? 'Resetting...' : 'Reset predictions (clear map)'}
-          </button>
-          <div style={{ fontSize: '11px', color: '#666', marginTop: '3px', fontStyle: 'italic' }}>
-            Clear risk scores for clean testing
-          </div>
-          <button 
             onClick={handleRecalculateAndPredict}
             disabled={isRecalculating}
             style={{
@@ -1713,25 +1681,9 @@ function App() {
           >
             {isRecalculating ? 'Recalculating...' : 'Recalculate & Re-predict'}
           </button>
-          <div style={{ 
-            fontSize: '11px', 
-            color: '#666', 
-            marginTop: '3px',
-            fontStyle: 'italic'
-          }}>
+          <div style={{ fontSize: '11px', color: '#666', marginTop: '3px', fontStyle: 'italic' }}>
             Updates distances and re-predicts with existing model
           </div>
-          <label style={{ display: 'block', marginTop: '10px', fontSize: '12px' }}>
-            Train/val split:
-          </label>
-          <select 
-            value={retrainMunicipio} 
-            onChange={e => setRetrainMunicipio(e.target.value)}
-            style={{ width: '100%', padding: '6px', marginTop: '4px', fontSize: '12px' }}
-          >
-            <option value="map_included">map_included (all map areas in training, recommended)</option>
-            <option value="blockCV">blockCV (original 15 municipalities)</option>
-          </select>
           <label style={{ display: 'block', marginTop: '10px', fontSize: '12px' }}>
             Model for retrain/repredict:
           </label>
@@ -1760,14 +1712,50 @@ function App() {
           >
             {isRetraining ? 'Retraining Model...' : 'Retrain Model'}
           </button>
-          <div style={{ 
-            fontSize: '11px', 
-            color: '#666', 
-            marginTop: '3px',
-            fontStyle: 'italic'
-          }}>
+          <div style={{ fontSize: '11px', color: '#666', marginTop: '3px', fontStyle: 'italic' }}>
             Retrains model with updated labels (takes several minutes)
           </div>
+
+          <button
+            type="button"
+            onClick={() => setShowMoreActions(!showMoreActions)}
+            style={{
+              width: '100%',
+              padding: '8px 10px',
+              marginTop: '12px',
+              backgroundColor: '#f0f0f0',
+              color: '#333',
+              border: '1px solid #ccc',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '13px',
+              fontWeight: '600',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between'
+            }}
+          >
+            <span>More actions</span>
+            <span style={{ fontSize: '10px' }}>{showMoreActions ? '▲' : '▼'}</span>
+          </button>
+          {showMoreActions && (
+            <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid #e0e0e0' }}>
+              <label style={{ display: 'block', marginTop: '4px', fontSize: '12px' }}>
+                Train/val split:
+              </label>
+              <select 
+                value={retrainMunicipio} 
+                onChange={e => setRetrainMunicipio(e.target.value)}
+                style={{ width: '100%', padding: '6px', marginTop: '4px', fontSize: '12px' }}
+              >
+                <option value="map_included">map_included (all map areas in training, recommended)</option>
+                <option value="blockCV">blockCV (original 15 municipalities)</option>
+              </select>
+              <div style={{ fontSize: '11px', color: '#666', marginTop: '6px', fontStyle: 'italic' }}>
+                Which municipalities to use for training vs validation when retraining. map_included uses all map areas; blockCV uses the original 15.
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Historical Events section - commented out for now */}

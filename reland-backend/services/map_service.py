@@ -3,7 +3,7 @@ Map service for providing map data
 """
 from typing import List, Dict, Any
 from math import isfinite
-from models import Location
+from models import Location, UserLabel
 from services.location_service import LocationService
 from services.event_service import EventService
 from utils.risk_calculator import RiskCalculator
@@ -16,14 +16,9 @@ class MapService:
     @staticmethod
     def get_map_data(selected_areas: List[str], score_to_use: str = 'risk_score') -> Dict[str, Any]:
         """
-        Get map data (risk heatmap and historical points) for selected areas
-        
-        Args:
-            selected_areas: List of municipio names
-            score_to_use: Risk score column to use
-            
-        Returns:
-            Dictionary with risk_heatmap_points, historical_points, and confirmed_events
+        Get map data (risk heatmap and historical points) for selected areas.
+        Locations with a user label (0 or 1) show the corresponding color and risk:
+        label 0 = mine-free -> Low risk (green); label 1 = confirmed mine -> High risk (red).
         """
         if not selected_areas:
             return {
@@ -43,18 +38,34 @@ class MapService:
                     "confirmed_events": []
                 }
             
-            # Calculate risk levels
+            # Get user labels for these locations so labeled points show correct color/risk
+            location_ids = [loc.id for loc in locations]
+            labels_by_location = {
+                ul.location_id: ul.label
+                for ul in UserLabel.query.filter(UserLabel.location_id.in_(location_ids)).all()
+            }
+            
+            # Calculate risk levels from model (used when no user label)
             risk_levels = RiskCalculator.calculate_risk_levels(locations, score_to_use)
             
-            # Build risk points
+            # Build risk points: override risk/color for locations that have a user label
             risk_points = []
             for location in locations:
-                risk_level = risk_levels.get(location.id, 'Low')
-                risk_score = getattr(location, score_to_use, None) or location.risk_score_lr
-                
-                # Ensure we have a valid numeric score
-                if risk_score is None or not isfinite(risk_score):
-                    risk_score = 0.0
+                user_label = labels_by_location.get(location.id)
+                if user_label is not None:
+                    # User label 0 = mine-free -> Low; label 1 = confirmed mine -> High
+                    if user_label == 0:
+                        risk_level = 'Low'
+                        risk_score = 0.0
+                    else:
+                        risk_level = 'High'
+                        risk_score = 1.0
+                else:
+                    risk_level = risk_levels.get(location.id, 'Low')
+                    risk_score = getattr(location, score_to_use, None) or location.risk_score_lr
+                    if risk_score is None or not isfinite(risk_score):
+                        risk_score = 0.0
+                    risk_score = float(risk_score)
                 
                 risk_points.append({
                     'LATITUD_Y': location.lat,

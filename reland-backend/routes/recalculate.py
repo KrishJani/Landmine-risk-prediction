@@ -319,27 +319,3 @@ def recalculate_and_predict():
         print(f"Error in recalculate_and_predict: {str(e)}")
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
-
-
-@api_bp.route('/reset_predictions', methods=['POST'])
-def reset_predictions():
-    """
-    Clear risk_score and risk_level for all locations (set to NULL).
-    Use before testing retrain/repredict from a clean state.
-    """
-    try:
-        from sqlalchemy import text
-        total = Location.query.count()
-        db.session.execute(text(
-            "UPDATE locations SET risk_score = NULL, risk_level = NULL"
-        ))
-        db.session.commit()
-        return jsonify({
-            "message": "All predictions cleared. Run retrain then recalculate_and_predict to repopulate.",
-            "locations_updated": total
-        }), 200
-    except Exception as e:
-        db.session.rollback()
-        import traceback
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
