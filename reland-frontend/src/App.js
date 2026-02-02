@@ -173,28 +173,19 @@ function App() {
     return normalized;
   };
 
-  // Helper function to match municipality name
-  const matchMunicipality = (featureName, searchName) => {
+  // Helper function to match municipality name (stable ref so loadPredictionsAndBorders doesn't change every render)
+  const matchMunicipality = useCallback((featureName, searchName) => {
     const featureNorm = normalizeMunicipalityName(featureName, false);
     const searchNorm = normalizeMunicipalityName(searchName, false);
-    
-    // Exact match
     if (featureNorm === searchNorm) return true;
-    
-    // Try with suffix removal
     const featureNormSuffix = normalizeMunicipalityName(featureName, true);
     const searchNormSuffix = normalizeMunicipalityName(searchName, true);
     if (featureNormSuffix === searchNormSuffix) return true;
-    
-    // Partial match (starts with)
     const baseName = searchNormSuffix.split()[0] || searchNormSuffix;
     if (featureNormSuffix.startsWith(baseName) && baseName.length >= 4) return true;
-    
-    // Contains match
     if (featureNormSuffix.includes(baseName) && baseName.length >= 4) return true;
-    
     return false;
-  };
+  }, []);
 
   // 1. Load municipality borders GeoJSON ONCE when the app loads
   useEffect(() => {
@@ -244,11 +235,9 @@ function App() {
       });
   }, []);
 
-  // 2. Fetch map data WHENEVER the 'selectedAreas' state changes
-  useEffect(() => {
-    // This 'useEffect' runs every time 'selectedAreas' is updated.
-    
-    // Don't fetch if no areas are selected
+  // Single function: load predictions first, then borders (borders always on top of predictions).
+  // Use this everywhere: initial load, area change, map style change, repredict/retrain, reset, after adding a label.
+  const loadPredictionsAndBorders = useCallback(() => {
     if (selectedAreas.length === 0) {
       setPredictionData(null);
       setHistoricalData(null);
@@ -256,100 +245,40 @@ function App() {
       setMunicipalityBorders(null);
       return;
     }
-    
-    // Create the query string (e.g., "?areas[]=Sonsón&areas[]=Argelia")
+
     const params = new URLSearchParams();
     selectedAreas.forEach(area => params.append('areas[]', area));
-    
-    // Fetch data from our Python backend!
+
     fetch(`${API_BASE_URL}/api/map_data?${params.toString()}`)
       .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP error! status: ${res.status}`);
-        }
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
         return res.json();
       })
       .then(data => {
-        console.log("Map data received:", data);
-        console.log(`Risk heatmap points: ${data.risk_heatmap_points?.length || 0}`);
-        console.log(`Historical points: ${data.historical_points?.length || 0}`);
-        console.log(`Confirmed events from map_data: ${data.confirmed_events?.length || 0}`);
-        
-        // Normalize risk scores to 0-1 range for better visualization
         const normalizeRiskScores = (points) => {
           if (!points || points.length === 0) return points;
-          
-          // Find min and max risk scores (use risk_score field from new backend)
           const scores = points.map(p => {
             const score = p.risk_score || p.sonson_avg || 0;
             return !isNaN(score) && isFinite(score) && score > 0 ? score : null;
           }).filter(s => s !== null);
-          
           if (scores.length === 0) {
-            // No valid scores, assign all as low risk (cyan)
-            return points.map(p => ({
-              ...p,
-              risk_score_normalized: 0,
-              sonson_avg_normalized: 0
-            }));
+            return points.map(p => ({ ...p, risk_score_normalized: 0, sonson_avg_normalized: 0 }));
           }
-          
           const minScore = Math.min(...scores);
           const maxScore = Math.max(...scores);
           const range = maxScore - minScore;
-          
-          // Debug summary (only log once, not per point)
-          const normalizedSamples = [];
-          const sampleCount = Math.min(5, points.length);
-          
-          // Normalize to 0-1 range
-          // If all scores are the same (range = 0), assign all as low risk (0)
-          const normalizedPoints = points.map((p, idx) => {
+          return points.map(p => {
             const score = p.risk_score || p.sonson_avg || 0;
-            
-            // Handle edge cases
             if (!isFinite(score) || score <= 0) {
-              return {
-                ...p,
-                risk_score_normalized: 0,
-                sonson_avg_normalized: 0
-              };
+              return { ...p, risk_score_normalized: 0, sonson_avg_normalized: 0 };
             }
-            
-            let normalized;
-            if (range <= 0 || Math.abs(range) < 1e-10) {
-              // All scores are the same - treat as low risk
-              normalized = 0;
-            } else {
-              // Normalize: (score - min) / range
-              normalized = Math.max(0, Math.min(1, (score - minScore) / range));
-            }
-            
-            // Collect samples for debugging
-            if (idx < sampleCount) {
-              normalizedSamples.push({ score, normalized });
-            }
-            
-            return {
-              ...p,
-              risk_score_normalized: normalized,
-              sonson_avg_normalized: normalized
-            };
+            const normalized = range <= 0 || Math.abs(range) < 1e-10
+              ? 0
+              : Math.max(0, Math.min(1, (score - minScore) / range));
+            return { ...p, risk_score_normalized: normalized, sonson_avg_normalized: normalized };
           });
-          
-          // Log summary once
-          console.log(`Risk normalization:`, {
-            minScore,
-            maxScore,
-            range,
-            pointsCount: points.length,
-            samples: normalizedSamples
-          });
-          
-          return normalizedPoints;
         };
-        
-        // We need to format this data into GeoJSON, the standard for maps
+
         const toGeoJSON = (points) => {
           if (!points || points.length === 0) return null;
           return {
@@ -357,81 +286,49 @@ function App() {
             features: points.map(p => ({
               type: 'Feature',
               geometry: { type: 'Point', coordinates: [p.LONGITUD_X, p.LATITUD_Y] },
-              properties: p // Attach all other data (risk, color, etc.)
+              properties: p
             }))
           };
         };
-        
-        // Use risk_heatmap_points from new backend structure
+
         const heatmapPoints = data.risk_heatmap_points || data.prediction_points || [];
-        const normalizedHeatmapPoints = normalizeRiskScores(heatmapPoints);
-        const heatmapGeoJSON = toGeoJSON(normalizedHeatmapPoints);
-        console.log("Heatmap GeoJSON created:", heatmapGeoJSON ? `${heatmapGeoJSON.features.length} features` : "null");
-        
-        // Debug: Check normalized values in GeoJSON
-        if (heatmapGeoJSON && heatmapGeoJSON.features.length > 0) {
-          const sampleProps = heatmapGeoJSON.features.slice(0, 5).map(f => ({
-            risk_score: f.properties.risk_score,
-            sonson_avg_normalized: f.properties.sonson_avg_normalized,
-            risk_score_normalized: f.properties.risk_score_normalized
-          }));
-          console.log("Sample normalized values in GeoJSON:", sampleProps);
-        }
-        
+        const heatmapGeoJSON = toGeoJSON(normalizeRiskScores(heatmapPoints));
+
+        // 1. Set predictions first (rendered first / bottom layer)
         setPredictionData(heatmapGeoJSON);
         setHistoricalData(toGeoJSON(data.historical_points || []));
         setClusterData(toGeoJSON(data.cluster_points || []));
-        
-        // Store confirmed events from map_data (only update if we don't have them yet)
-        // This prevents overwriting the full list when areas change
-        // We use a functional update to avoid dependency issues
-        setConfirmedEvents(prevEvents => {
-          if (data.confirmed_events) {
-            // Only update if we don't have events yet, or if we get more events
-            if (prevEvents.length === 0) {
-              return data.confirmed_events;
-            } else if (data.confirmed_events.length > prevEvents.length) {
-              return data.confirmed_events;
-            }
-          }
-          return prevEvents; // Keep existing events
+        setConfirmedEvents(prev => {
+          if (!data.confirmed_events) return prev;
+          if (prev.length === 0) return data.confirmed_events;
+          if (data.confirmed_events.length > prev.length) return data.confirmed_events;
+          return prev;
         });
+
+        // 2. Then set borders (rendered second / on top of predictions)
+        if (allMunicipalityBorders && allMunicipalityBorders.features) {
+          const validAreas = selectedAreas.filter(area => area && area.toLowerCase() !== 'unknown');
+          const filteredFeatures = validAreas.length > 0
+            ? allMunicipalityBorders.features.filter(feature => {
+                const featureName = feature.properties?.MPIO_CNMBR || feature.properties?.municipio || '';
+                return validAreas.some(area => matchMunicipality(featureName, area));
+              })
+            : allMunicipalityBorders.features;
+          setMunicipalityBorders({ type: 'FeatureCollection', features: filteredFeatures });
+        } else {
+          setMunicipalityBorders(null);
+        }
       })
       .catch(err => {
         console.error("Error fetching map data:", err);
         alert("Error fetching map data from backend.");
       });
-    
-    // Filter municipality borders client-side from loaded GeoJSON
-    if (allMunicipalityBorders && allMunicipalityBorders.features) {
-      let filteredFeatures = allMunicipalityBorders.features;
-      
-      // Filter by selected areas if any are selected
-      if (selectedAreas.length > 0) {
-        const validAreas = selectedAreas.filter(area => area && area.toLowerCase() !== 'unknown');
-        if (validAreas.length > 0) {
-          filteredFeatures = allMunicipalityBorders.features.filter(feature => {
-            // Try to match against MPIO_CNMBR property (from shapefile)
-            const featureName = feature.properties?.MPIO_CNMBR || feature.properties?.municipio || '';
-            return validAreas.some(area => matchMunicipality(featureName, area));
-          });
-        }
-      }
-      
-      // Create filtered GeoJSON
-      const filteredGeoJSON = {
-        type: 'FeatureCollection',
-        features: filteredFeatures
-      };
-      
-      setMunicipalityBorders(filteredGeoJSON);
-      console.log(`Filtered municipality borders: ${filteredFeatures.length} features (from ${allMunicipalityBorders.features.length} total)`);
-    } else {
-      // If GeoJSON not loaded yet, clear borders
-      setMunicipalityBorders(null);
-    }
-      
-  }, [selectedAreas, allMunicipalityBorders]); // The "dependency array" - this re-runs the effect
+  }, [selectedAreas, allMunicipalityBorders, matchMunicipality]);
+
+  // Whenever areas or borders GeoJSON change, load predictions then borders
+  useEffect(() => {
+    loadPredictionsAndBorders();
+  }, [loadPredictionsAndBorders]);
 
   
   // --- Event Handlers ---
@@ -734,10 +631,7 @@ function App() {
           alert(`Error: ${data.error}`);
         } else {
           alert(`Success! ${data.message}\nUpdated ${data.updated_count || 0} locations.${data.predictions_count ? `\nGenerated ${data.predictions_count} predictions.` : ''}`);
-          // Refresh map data to show updated predictions
-          const currentAreas = [...selectedAreas];
-          setSelectedAreas([]);
-          setTimeout(() => setSelectedAreas(currentAreas), 100);
+          loadPredictionsAndBorders();
         }
       })
       .catch(err => {
@@ -829,9 +723,7 @@ function App() {
           alert(`Error: ${data.error}`);
         } else {
           alert(`${data.message}\nLocations updated: ${data.locations_updated ?? 0}`);
-          const currentAreas = [...selectedAreas];
-          setSelectedAreas([]);
-          setTimeout(() => setSelectedAreas(currentAreas), 100);
+          loadPredictionsAndBorders();
         }
       })
       .catch(err => {
@@ -895,11 +787,7 @@ function App() {
                   clearInterval(pollInterval);
                   setIsRetraining(false);
                   alert(`✅ Model training completed!\n\n${status.progress_message || 'Training finished successfully'}\n\nResults: ${status.result?.experiment_dir || 'experiments directory'}`);
-                  
-                  // Refresh map data to show updated predictions
-                  const currentAreas = [...selectedAreas];
-                  setSelectedAreas([]);
-                  setTimeout(() => setSelectedAreas(currentAreas), 100);
+                  loadPredictionsAndBorders();
                 } else if (status.status === 'failed') {
                   clearInterval(pollInterval);
                   setIsRetraining(false);
@@ -979,6 +867,7 @@ function App() {
         } else {
           // Update local state
           const existingIndex = userLabels.findIndex(l => l.location_id === data.location_id);
+          const isNewLabel = existingIndex < 0;
           if (existingIndex >= 0) {
             const updated = [...userLabels];
             updated[existingIndex] = data;
@@ -986,10 +875,10 @@ function App() {
           } else {
             setUserLabels([...userLabels, data]);
           }
-          
-          // Refresh confirmed events if label changed (either to 1 or from 1 to 0)
+
           fetchConfirmedEvents();
-          
+          // Only refetch map data when adding a new label (so new point appears); skip refetch on edit
+          if (isNewLabel) loadPredictionsAndBorders();
           setShowLabelDialog(false);
           setSelectedPoint(null);
           setLabelForm({ label: null, notes: '', manualLat: '', manualLon: '', useManualCoords: false });
@@ -1017,8 +906,14 @@ function App() {
         if (data.error) {
           alert(`Error: ${data.error}`);
         } else {
-          setUserLabels(userLabels.filter(l => l.location_id !== selectedPoint.location_id));
-          fetchConfirmedEvents(); // Refresh confirmed events
+          const deletedLocationId = selectedPoint.location_id;
+          setUserLabels(userLabels.filter(l => l.location_id !== deletedLocationId));
+          setPredictionData(prev => {
+            if (!prev || !prev.features) return prev;
+            const filtered = prev.features.filter(f => !f.properties || f.properties.location_id !== deletedLocationId);
+            return filtered.length === prev.features.length ? prev : { ...prev, features: filtered };
+          });
+          fetchConfirmedEvents();
           setShowLabelDialog(false);
           setSelectedPoint(null);
           alert('Label deleted successfully!');
