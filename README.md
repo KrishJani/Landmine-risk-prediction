@@ -14,14 +14,19 @@ Landmine-risk-prediction/
 ├── run_reland.sh        # Example training run
 │
 ├── docs/                # Project documentation
-│   ├── HANDOVER_GUIDE.md
+│   ├── HANDOVER_GUIDE.md    # Start here for handover
+│   ├── AWS_ARCHITECTURE_EXPLAINED.md
+│   ├── DEPLOY_AFTER_CHANGE.md
+│   ├── CODE_OVERVIEW.md
 │   ├── DATA_ARCHITECTURE.md
+│   ├── MANUAL_DEPLOYMENT_AWS_CONSOLE.md  # Deploy via AWS website step-by-step
 │   └── DEPLOYMENT_DETAILED_DOCUMENTATION.md
 ├── scripts/             # Utilities (run from project root)
-│   ├── run_checks.py        # DB + CSV checks
-│   ├── diagnose_causes.py   # Diagnose uniform-risk causes
-│   ├── csv_labels_check.py  # Label counts per municipality
-│   └── deploy-helper.sh     # AWS deployment helper
+│   ├── deploy_reland.sh    # Deploy frontend/backend/DB (--frontend, --backend, --database)
+│   ├── run_checks.py       # DB + CSV checks
+│   ├── diagnose_causes.py  # Diagnose uniform-risk causes
+│   ├── csv_labels_check.py # Label counts per municipality
+│   └── deploy-helper.sh    # AWS deployment helper
 │
 ├── reland-backend/      # Flask API (see reland-backend/README.md)
 ├── reland-frontend/     # React map UI
@@ -43,7 +48,8 @@ Landmine-risk-prediction/
 - **Database:** PostgreSQL + PostGIS on RDS  
 - **Training:** EC2 Spot (g4dn.xlarge) or local worker  
 
-See [docs/](docs/) for handover, data architecture, and deployment details.
+**Handover:** See [docs/HANDOVER_GUIDE.md](docs/HANDOVER_GUIDE.md) for the professor handover (architecture, deploy-after-change, code overview, data sources).  
+See [docs/](docs/) for data architecture and deployment details.
 
 ## License
 

@@ -82,7 +82,7 @@ jobs:
             "ImageRepository": {
               "ImageIdentifier": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
               "ImageConfiguration": {
-                "Port": "8000",
+                "Port": "8080",
                 "RuntimeEnvironmentVariables": {
                   "FLASK_ENV": "production",
                   "ENVIRONMENT": "production",
@@ -93,7 +93,7 @@ jobs:
                   "SECRET_KEY": "${{ secrets.SECRET_KEY || 'change-me-in-production' }}",
                   "GOOGLE_GEOCODING_API_KEY": "${{ secrets.GOOGLE_GEOCODING_API_KEY || '' }}",
                   "USE_REDIS": "false",
-                  "PORT": "8000",
+                  "PORT": "8080",
                   "DEBUG": "False"
                 }
               },

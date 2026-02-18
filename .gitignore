@@ -27,6 +27,7 @@ reland-backend/reland.db
 
 # Environment variables (contain sensitive data)
 .env
+deploy.env
 reland-backend/.env
 reland-frontend/.env
 
