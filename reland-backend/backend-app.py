@@ -1041,10 +1041,12 @@ def recalculate_and_predict():
             from dataset_db import EventDB
             from save_predictions_db import save_predictions_to_db_orm, save_predictions_to_db_by_locations
             from sklearn.neighbors import NearestNeighbors
-            
+            from utils.train_municipios_loader import load_train_municipios_for_repredict
+
             # Load dataset with updated dist_old_mine
+            # Use same train_municipios as model training for correct scaler (Fix 2: align scaler with model)
             print("  Loading dataset with updated features...")
-            train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']
+            train_municipios = load_train_municipios_for_repredict(timestamp, municipio)
             val_municipio = 'ALL' if municipio == 'blockCV' else municipio.upper()
             
             all_data = EventDB(

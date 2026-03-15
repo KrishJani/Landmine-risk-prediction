@@ -6,6 +6,11 @@ experiments/
 
 # all pycache
 __pycache__/
+*.pyc
+*.pyo
+
+# Elastic Beanstalk deployment artifacts
+reland-backend/.elasticbeanstalk/app_versions/*.zip
 
 # ipynb checkpoints
 .ipynb_checkpoints/

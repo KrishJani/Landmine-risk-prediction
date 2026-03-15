@@ -30,9 +30,7 @@ Landmine-risk-prediction/
 │
 ├── reland-backend/      # Flask API (see reland-backend/README.md)
 ├── reland-frontend/     # React map UI
-├── pytorch_tabnet_irm/  # TabNet IRM model code
-├── tree/                # Tree layout (visualization)
-└── OoD-Bench-main/      # Out-of-distribution bench (optional)
+└── pytorch_tabnet_irm/  # TabNet IRM model code
 ```
 
 ## Quick start

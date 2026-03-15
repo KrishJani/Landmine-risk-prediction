@@ -124,7 +124,8 @@ class RELand():
         if val_dataset is not None:
             val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
         elif test_dataset is not None:
-            test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+            # Use num_workers=0 to avoid pickle error when test_dataset is a local class (e.g. DBLocationDataset in recalculate)
+            test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=0)
 
         if test_dataset is not None:
             self.model.eval()

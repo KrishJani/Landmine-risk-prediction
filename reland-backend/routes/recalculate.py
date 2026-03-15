@@ -105,9 +105,11 @@ def recalculate_and_predict():
             
             from dataset_db import EventDB
             from save_predictions_db import save_predictions_to_db_orm, save_predictions_to_db_by_locations
-            
+            from utils.train_municipios_loader import load_train_municipios_for_repredict
+
             # Load dataset with updated dist_old_mine
-            train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']
+            # Use same train_municipios as model training for correct scaler (Fix 2: align scaler with model)
+            train_municipios = load_train_municipios_for_repredict(timestamp, municipio)
             # FIX: When municipio is 'blockCV', use 'ALL' to load ALL locations from CSV
             # EventDB will fall back to all locations when municipio is not found (see dataset_db.py line 260-264)
             if municipio == 'blockCV':
@@ -124,22 +126,38 @@ def recalculate_and_predict():
                 db_url=config.DATABASE_URL
             )
             
+            print(f"  ================================================ Subset: {subset} ================================================")
             print(f"  Loaded {len(all_data)} locations from EventDB (CSV grid)")
             print(f"  Locations shape: {all_data.locations.shape}")
             print(f"  TabX shape: {all_data.tabX.shape}")
             
-            # Predict per DB location using nearest-CSV features so each map point gets its own prediction (spatial variation)
-            from sklearn.neighbors import NearestNeighbors
+            # Match DB locations to CSV grid by (lon, lat). DB and CSV are the same grid; no new locations.
+            _COORD_DECIMALS = 6  # match coordinates to this precision (float-safe)
             db_lon_lat = np.array([[loc.lon, loc.lat] for loc in all_locations], dtype=np.float64)
             csv_lon_lat = np.column_stack([all_data.locations[:, 0], all_data.locations[:, 1]])
-            nn = NearestNeighbors(n_neighbors=1, metric='euclidean')
-            nn.fit(csv_lon_lat)
-            _, nearest_idx = nn.kneighbors(db_lon_lat)
-            nearest_idx = nearest_idx.flatten()
-            tabX_db = np.array(all_data.tabX[nearest_idx], dtype=np.float32)
-            # Keep scaled lon/lat from nearest CSV row (do NOT overwrite with raw DB coords) so model input matches training scale
+            csv_key_to_idx = {}
+            for i in range(len(csv_lon_lat)):
+                key = (round(float(csv_lon_lat[i, 0]), _COORD_DECIMALS), round(float(csv_lon_lat[i, 1]), _COORD_DECIMALS))
+                if key not in csv_key_to_idx:
+                    csv_key_to_idx[key] = i
+            csv_idx = []
+            missing = []
+            for lon, lat in db_lon_lat:
+                key = (round(float(lon), _COORD_DECIMALS), round(float(lat), _COORD_DECIMALS))
+                if key not in csv_key_to_idx:
+                    missing.append((lon, lat))
+                else:
+                    csv_idx.append(csv_key_to_idx[key])
+            if missing:
+                raise RELandException(
+                    f"DB locations must match CSV grid. {len(missing)} DB location(s) not found in CSV (e.g. {missing[0]}). "
+                    "Ensure the DB was seeded from the same CSV and no extra locations were added."
+                )
+            csv_idx = np.array(csv_idx, dtype=np.int64)
+            tabX_db = np.array(all_data.tabX[csv_idx], dtype=np.float32)
+            locations_xy = np.array(csv_lon_lat[csv_idx], dtype=np.float64)
             n_db = len(all_locations)
-            print(f"  Built feature matrix for {n_db} DB locations (nearest-CSV row per location)")
+            print(f"  Matched {n_db} DB locations to CSV grid by (lon, lat)")
             
             # Minimal dataset for PyTorch/RELand: one row per DB location
             class DBLocationDataset:
@@ -158,7 +176,7 @@ def recalculate_and_predict():
                         torch.tensor((self.locations[idx, 0], self.locations[idx, 1]), dtype=torch.float32),
                         torch.tensor(self.hist_mine[idx], dtype=torch.float32),
                     )
-            db_dataset = DBLocationDataset(tabX_db, db_lon_lat)
+            db_dataset = DBLocationDataset(tabX_db, locations_xy)
             
             # Load model based on type
             if model_name in ['TabCmpt', 'MLP']:

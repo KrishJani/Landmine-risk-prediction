@@ -111,7 +111,6 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
             print("No locations in DB, skipping predict-per-DB-location")
             return
 
-        train_municipios = ['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR']
         val_municipio = 'ALL' if (job.municipio or 'blockCV') == 'blockCV' else (job.municipio or 'blockCV').upper()
         subset = job.subset or 'full'
         model_name = job.model_name or 'TabCmpt'
@@ -121,6 +120,10 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
         sys.path.insert(0, reland_backend)
         from dataset_db import EventDB
         from save_predictions_db import save_predictions_to_db_by_locations
+        from utils.train_municipios_loader import load_train_municipios_for_repredict
+
+        # Use same train_municipios as model training for correct scaler (Fix 2: align scaler with model)
+        train_municipios = load_train_municipios_for_repredict(timestamp, job.municipio or 'blockCV')
 
         all_data = EventDB(
             train_municipios=train_municipios,
