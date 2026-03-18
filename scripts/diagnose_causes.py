@@ -9,6 +9,7 @@ Run from project root: python scripts/diagnose_causes.py
 Uses: stdlib + psql for DB; for check 3 needs reland-backend venv (see bottom).
 """
 import csv
+import argparse
 import math
 import os
 import subprocess
@@ -195,7 +196,7 @@ def check_2_feature_variation(csv_path):
     print()
 
 
-def check_3_model_output():
+def check_3_model_output(model_name='Lightweight', municipio='map_included', timestamp=None, subset='full'):
     """Check: does the model output vary per municipality? Requires backend env."""
     print("=" * 60)
     print("CHECK 3: Model output variation per municipality")
@@ -218,11 +219,14 @@ def check_3_model_output():
         print(f"  EventDB import failed: {e}. Run from project root with PYTHONPATH including backend.\n")
         return
     try:
+        from utils.train_municipios_loader import load_train_municipios_for_repredict
+        val_municipio = 'ALL' if municipio in ['blockCV', 'map_included'] else municipio.upper()
+        train_municipios = load_train_municipios_for_repredict(timestamp, municipio)
         # Load full dataset (val_municipio='ALL' -> all rows)
         all_data = EventDB(
-            train_municipios=['BOLÍVAR', 'MURINDÓ', 'PUERTO LIBERTADOR'],
-            val_municipio='ALL',
-            subset='full',
+            train_municipios=train_municipios,
+            val_municipio=val_municipio,
+            subset=subset,
             split='val',
             db_url=db_url
         )
@@ -250,12 +254,17 @@ def check_3_model_output():
     except ImportError:
         print("  ModelFinder not found. Run from backend env.\n")
         return
-    timestamp, fold_paths = ModelFinder.find_all_fold_models_in_latest_experiment('Lightweight', 'blockCV')
+    if timestamp:
+        exp_dir = Path(PROJECT_ROOT) / 'experiments' / timestamp
+        ext = '.pkl' if model_name not in ['TabCmpt', 'MLP'] else '.pth'
+        fold_paths = sorted(list(exp_dir.glob(f'*{ext}')))
+    else:
+        timestamp, fold_paths = ModelFinder.find_all_fold_models_in_latest_experiment(model_name, municipio)
+        if not fold_paths:
+            model_path, _, _ = ModelFinder.find_latest_model(model_name, municipio)
+            fold_paths = [model_path] if model_path else []
     if not fold_paths:
-        model_path, _, _ = ModelFinder.find_latest_model('Lightweight', 'blockCV')
-        fold_paths = [model_path] if model_path else []
-    if not fold_paths:
-        print("  No Lightweight model found in experiments/. Train first or use TabCmpt.\n")
+        print(f"  No {model_name} model found in experiments/ for municipio={municipio}.\n")
         return
     import pickle
     try:
@@ -300,9 +309,21 @@ def check_3_model_output():
 if __name__ == '__main__':
     # For Check 3 (model output) you need pandas/sklearn/sqlalchemy. Run with backend venv:
     #   cd reland-backend && source venv/bin/activate && cd .. && python scripts/diagnose_causes.py
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='Lightweight', help='Model type, e.g. Lightweight | TabCmpt')
+    parser.add_argument('--municipio', default='map_included', help='Split name from train_val_stream, e.g. map_included | blockCV')
+    parser.add_argument('--timestamp', default=None, help='Optional experiment timestamp to force')
+    parser.add_argument('--subset', default='full', help='Feature subset used by model, e.g. full | geo | single')
+    args = parser.parse_args()
+
     csv_path = os.path.join(PROJECT_ROOT, 'processed_dataset', 'resolution_0.5.csv')
     db_locations = get_db_locations_by_municipio()
     check_1_coordinate_mismatch(db_locations, csv_path)
     check_2_feature_variation(csv_path)
-    check_3_model_output()
+    check_3_model_output(
+        model_name=args.model,
+        municipio=args.municipio,
+        timestamp=args.timestamp,
+        subset=args.subset
+    )
     print("Done.")

@@ -69,7 +69,23 @@ def _make_dataset(train_municipios, val_municipio, subset, split):
             "Database URL not set. "
             "Set LOCAL_DATABASE_URL for local development or DATABASE_URL for production."
         )
-    return EventDB(train_municipios, val_municipio, subset, split, db_url=db_url)
+    # Training-time datasets must never use unlabeled cells (mines_outcome == -1) as supervision.
+    # However, for `split='val'` we still keep all grid cells (including -1) so predicted_proba can
+    # generate the full risk map; metrics are computed only on labeled rows (see below).
+    eventdb_kwargs = {
+        "db_url": db_url,
+        "drop_unlabeled_labels": True,
+    }
+    if split == "val":
+        eventdb_kwargs["drop_unlabeled_labels_in_val"] = False
+
+    return EventDB(
+        train_municipios,
+        val_municipio,
+        subset,
+        split,
+        **eventdb_kwargs,
+    )
 
 def main(timestamp : str, train_val_stream : List):
     # TODO: ood bench
@@ -141,11 +157,22 @@ def main(timestamp : str, train_val_stream : List):
                 else:
                     model = RELand(X_train.shape[1], args)
             elif model_name == 'Lightweight':
-    # Polynomial features (degree=2) so the linear classifier can vary risk within municipalities (lon², lat², lon*lat, etc.)
+                # IMPORTANT:
+                # Apply polynomial expansion only to lon/lat.
+                # Expanding all features to degree-2 creates a very large interaction space
+                # and tends to produce saturated probabilities ("all red" maps).
                 from sklearn.pipeline import Pipeline
+                from sklearn.compose import ColumnTransformer
                 from sklearn.preprocessing import PolynomialFeatures
+                lon_idx = val_data.features.index('LONGITUD_X')
+                lat_idx = val_data.features.index('LATITUD_Y')
+                other_idx = [j for j in range(X_train.shape[1]) if j not in [lon_idx, lat_idx]]
+
                 model = Pipeline([
-                    ('poly', PolynomialFeatures(degree=2, include_bias=False)),
+                    ('features', ColumnTransformer([
+                        ('poly_lonlat', PolynomialFeatures(degree=2, include_bias=False), [lon_idx, lat_idx]),
+                        ('linear_rest', 'passthrough', other_idx),
+                    ], remainder='drop')),
                     ('lr', LogisticRegression(solver='saga', max_iter=500, random_state=737, C=0.1))
                 ])
             elif model_name == 'LR' and objective == 'erm':
@@ -221,16 +248,51 @@ def main(timestamp : str, train_val_stream : List):
                     test_pred = model.predict_proba(np.array(X_test))[:,1]
             else:
                 model.fit(X_train,y_train)
-                val_pred = model.predict_proba(np.array(X_val))[:,1]
+                proba = model.predict_proba(np.array(X_val))
+                classes = getattr(model, 'classes_', None)
+                if classes is None and hasattr(model, 'named_steps'):
+                    classes = getattr(model.named_steps.get('lr', None), 'classes_', None)
+                if classes is None:
+                    val_pred = proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
+                else:
+                    classes = list(classes)
+                    if 1 in classes:
+                        val_pred = proba[:, classes.index(1)]
+                    elif (0 in classes) and (1.0 in classes):
+                        val_pred = proba[:, classes.index(1.0)]
+                    else:
+                        val_pred = proba[:, int(np.argmax(classes))]
                 if args.municipio == 'puerto' or args.municipio == 'murindo':
-                    test_pred = model.predict_proba(np.array(X_test))[:,1]
+                    proba_t = model.predict_proba(np.array(X_test))
+                    if classes is None:
+                        test_pred = proba_t[:, 1] if proba_t.shape[1] > 1 else proba_t[:, 0]
+                    else:
+                        test_pred = proba_t[:, classes.index(1)] if 1 in classes else proba_t[:, int(np.argmax(classes))]
             
             if model_name != 'TabCmpt' and model_name != 'MLP':
-                roc = roc_auc_score(y_val, val_pred)
-                precision, recall, _ = precision_recall_curve(y_val, val_pred)
-                pr = auc(recall, precision)
-                height = mean_height(y_val, val_pred)
-                rheight = mean_reverse_height(y_val, val_pred)
+                # Some splits (e.g. Puerto Libertador) can have no labeled points (all y == -1).
+                # We compute metrics only on labeled rows (y in {0,1}).
+                labeled_mask = np.isin(y_val, [0, 1])
+                if labeled_mask.sum() == 0:
+                    roc = float('nan')
+                    pr = float('nan')
+                    height = float('nan')
+                    rheight = float('nan')
+                else:
+                    y_val_l = y_val[labeled_mask]
+                    val_pred_l = val_pred[labeled_mask]
+                    unique_y = np.unique(y_val_l)
+                    if len(unique_y) < 2:
+                        roc = float('nan')
+                        pr = float('nan')
+                        height = float('nan')
+                        rheight = float('nan')
+                    else:
+                        roc = roc_auc_score(y_val_l, val_pred_l)
+                        precision, recall, _ = precision_recall_curve(y_val_l, val_pred_l)
+                        pr = auc(recall, precision)
+                        height = mean_height(y_val_l, val_pred_l)
+                        rheight = mean_reverse_height(y_val_l, val_pred_l)
                 
                 ckpt = dict()
                 ckpt['roc'] = roc
@@ -273,30 +335,32 @@ def main(timestamp : str, train_val_stream : List):
             predicted_proba_df = pd.concat(predicted_proba, axis=0)
             predicted_proba_df.to_csv(f'./experiments/{timestamp}/predicted_proba.csv',index=False)
 
-            _, axes = plt.subplots(nrows=1, ncols=2, figsize=(14,6))
-            mappable = axes[0].scatter(lat_lon[:,0], lat_lon[:,1], c=val_prob)
-            axes[0].set_title(f'{mpio}\n'
-                            f'roc-{roc:.3f}-pr-{pr:.3f}\n'
-                            f'height-{height:.3f}-rheight-{rheight:.3f}')
+            # Plot only when we have at least one point (colorbar crashes on empty scatter).
+            if len(lat_lon) > 0:
+                _, axes = plt.subplots(nrows=1, ncols=2, figsize=(14,6))
+                mappable = axes[0].scatter(lat_lon[:,0], lat_lon[:,1], c=val_prob)
+                axes[0].set_title(
+                    f'{mpio}\nroc-{roc:.3f}-pr-{pr:.3f}\nheight-{height:.3f}-rheight-{rheight:.3f}'
+                )
 
-            y_truth = np.array([int(y) for y in val_data.y])
-            colors = ['yellow','navy']
-            pos_idx = y_truth == 1
-            neg_idx = y_truth == 0
-            neg = axes[1].scatter(lat_lon[:,0][neg_idx], lat_lon[:,1][neg_idx], c=colors[1])
-            pos = axes[1].scatter(lat_lon[:,0][pos_idx], lat_lon[:,1][pos_idx], c=colors[0])
-            axes[1].set_title('truth')
-            axes[1].legend((pos, neg),('pos','neg'))
-            
-            plt.tight_layout()
-            plt.colorbar(mappable,ax=axes[0])
-            plt.savefig(f'./experiments/{timestamp}/{mpio}.png')
-            plt.clf()
+                y_truth = np.array([int(y) for y in val_data.y])
+                colors = ['yellow','navy']
+                pos_idx = y_truth == 1
+                neg_idx = y_truth == 0
+                neg = axes[1].scatter(lat_lon[:,0][neg_idx], lat_lon[:,1][neg_idx], c=colors[1])
+                pos = axes[1].scatter(lat_lon[:,0][pos_idx], lat_lon[:,1][pos_idx], c=colors[0])
+                axes[1].set_title('truth')
+                axes[1].legend((pos, neg),('pos','neg'))
+                
+                plt.tight_layout()
+                plt.colorbar(mappable,ax=axes[0])
+                plt.savefig(f'./experiments/{timestamp}/{mpio}.png')
+                plt.clf()
 
-        res['mean/std_roc'] = [np.mean(res['roc']), np.std(res['roc'])]
-        res['mean/std_pr'] = [np.mean(res['pr']), np.std(res['pr'])]
-        res['mean/std_height'] = [np.mean(res['height']), np.std(res['height'])]
-        res['mean/std_rheight'] = [np.mean(res['rheight']), np.std(res['rheight'])]
+        res['mean/std_roc'] = [np.nanmean(res['roc']), np.nanstd(res['roc'])]
+        res['mean/std_pr'] = [np.nanmean(res['pr']), np.nanstd(res['pr'])]
+        res['mean/std_height'] = [np.nanmean(res['height']), np.nanstd(res['height'])]
+        res['mean/std_rheight'] = [np.nanmean(res['rheight']), np.nanstd(res['rheight'])]
         with open(f"./experiments/{timestamp}/metrics.json", 'w') as outfile:
             json.dump(res, outfile, indent=4)  
 
@@ -324,15 +388,16 @@ def main(timestamp : str, train_val_stream : List):
                                     'LATITUD_Y':lat_lon_test[:,1],
                                     'predicted_proba':test_pred}))
             test_df.to_csv(f'./experiments/{timestamp}/test_results.csv',index=False)
-            _, axes = plt.subplots(nrows=1, ncols=1, figsize=(5,5))
-            mappable = plt.scatter(lat_lon_test[:,0], lat_lon_test[:,1], c=test_pred)
-            if args.municipio == 'puerto':
-                axes.set_title('PUERTO LIBERTADOR')
-            elif args.municipio == 'murindo':
-                axes.set_title('MURINDÓ')
-            plt.colorbar(mappable)
-            plt.savefig(f'./experiments/{timestamp}/test_results.png')
-            plt.clf()
+            if len(lat_lon_test) > 0:
+                _, axes = plt.subplots(nrows=1, ncols=1, figsize=(5,5))
+                mappable = plt.scatter(lat_lon_test[:,0], lat_lon_test[:,1], c=test_pred)
+                if args.municipio == 'puerto':
+                    axes.set_title('PUERTO LIBERTADOR')
+                elif args.municipio == 'murindo':
+                    axes.set_title('MURINDÓ')
+                plt.colorbar(mappable)
+                plt.savefig(f'./experiments/{timestamp}/test_results.png')
+                plt.clf()
 
 
     return res
@@ -411,6 +476,3 @@ if __name__ == "__main__":
         shutil.copy(py, f'./experiments/{timestamp}/code/{fname}') 
     
     main(timestamp, train_val_stream)
-
-    
-    

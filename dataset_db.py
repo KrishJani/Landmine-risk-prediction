@@ -19,7 +19,9 @@ class EventDB(Dataset):
     def __init__(self, 
                  train_municipios : List[str], val_municipio : str, 
                  subset : str, split : str,
-                 db_url : str = None):
+                 db_url : str = None,
+                 drop_unlabeled_labels: bool = False,
+                 drop_unlabeled_labels_in_val: Optional[bool] = None):
         """
         Landmine dataset class with database integration.
 
@@ -29,9 +31,18 @@ class EventDB(Dataset):
             subset (str): full | geo | single
             split (str) : train | val
             db_url (str): Database connection string. If None, reads from DATABASE_URL env var.
+            drop_unlabeled_labels (bool): If True, remove rows with `mines_outcome == -1` from
+                both training and validation tensors (X/y). This ensures unlabeled cells are
+                never used to fit models or compute validation metrics.
+            drop_unlabeled_labels_in_val (Optional[bool]): If set explicitly, controls whether
+                `mines_outcome == -1` rows are dropped from the `val`/prediction output tensors.
+                By default, it follows `drop_unlabeled_labels`.
         """ 
         self.split = split
         self.val_municipio = val_municipio
+        self.drop_unlabeled_labels = drop_unlabeled_labels
+        drop_unlabeled_in_train = drop_unlabeled_labels
+        drop_unlabeled_in_val = drop_unlabeled_labels if drop_unlabeled_labels_in_val is None else drop_unlabeled_labels_in_val
         
         # Get database URL
         if db_url is None:
@@ -197,6 +208,7 @@ class EventDB(Dataset):
             merged = merged.drop(columns=['mines_outcome_db'])
         
         data = merged.drop(columns=['merge_key'], errors='ignore')
+        label_is_labeled = data['mines_outcome'].isin([0, 1])
         
         print(f"  Merged data: {len(data)} rows")
         
@@ -266,18 +278,33 @@ class EventDB(Dataset):
         
         tabX = pd.get_dummies(columns=['land_use', 'weather', 'relief'], data = data)[self.features]
         if val_municipio == 'RANDOM' or val_municipio == 'PUERTO LIBERTADOR' or val_municipio == 'MURINDÓ': # train_val split + test
-            train_tabX_combined = tabX.loc[list(data[data['Municipio'].isin(train_municipios)].index),self.features]
+            train_idx_all = data[data['Municipio'].isin(train_municipios)].index
+            if drop_unlabeled_in_train:
+                train_idx_all = data[data['Municipio'].isin(train_municipios) & label_is_labeled].index
+            train_tabX_combined = tabX.loc[list(train_idx_all), self.features]
             np.random.RandomState(737)
             train_idx = pd.Index(np.random.choice(train_tabX_combined.index, int(len(train_tabX_combined)*0.7), replace=False))
             train_tabX = train_tabX_combined.loc[train_idx]
             if val_municipio == 'RANDOM':
                 val_tabX = train_tabX_combined.loc[~train_tabX_combined.index.isin(train_idx)]
             elif val_municipio == 'PUERTO LIBERTADOR' or val_municipio == 'MURINDÓ':
-                val_tabX = tabX.loc[list(data[data['Municipio'] == val_municipio].index),self.features]
+                val_idx_all = data[data['Municipio'] == val_municipio].index
+                if drop_unlabeled_in_val:
+                    val_idx_all = data[(data['Municipio'] == val_municipio) & label_is_labeled].index
+                val_tabX = tabX.loc[list(val_idx_all), self.features]
         else:
-            train_tabX = tabX.loc[list(data[data['Municipio'].isin(train_municipios)].index),self.features]
-            val_municipio_filtered = data[data['Municipio'] == val_municipio]
-            if len(val_municipio_filtered) == 0:
+            train_idx_all = data[data['Municipio'].isin(train_municipios)].index
+            if drop_unlabeled_in_train:
+                train_idx_all = data[data['Municipio'].isin(train_municipios) & label_is_labeled].index
+            train_tabX = tabX.loc[list(train_idx_all), self.features]
+
+            val_rows_all = data[data['Municipio'] == val_municipio]
+            val_municipio_exists = len(val_rows_all) > 0
+            val_municipio_filtered = val_rows_all
+            if drop_unlabeled_in_val:
+                val_municipio_filtered = val_rows_all[val_rows_all['mines_outcome'].isin([0, 1])]
+
+            if not val_municipio_exists:
                 # If val_municipio not found, use all data for prediction (common for blockCV or when predicting on all locations)
                 print(f"  ⚠️  Warning: Municipio '{val_municipio}' not found in data. Using all locations for prediction.")
                 print(f"  Available municipios: {sorted(data['Municipio'].unique())}")
@@ -298,6 +325,11 @@ class EventDB(Dataset):
                 print(f"  Available municipios in data: {sorted(data['Municipio'].unique())}")
         
         scaler = StandardScaler()
+        if len(train_tabX) == 0:
+            raise ValueError(
+                "EventDB received drop_unlabeled_labels=True but the filtered training set is empty. "
+                "Check that training municipalities contain at least one labeled row (mines_outcome in {0,1})."
+            )
         train_scaler = scaler.fit(train_tabX[self.numeric_cols])
         train_tabX[self.numeric_cols] = train_scaler.transform(train_tabX[self.numeric_cols])
         # Only transform val_tabX if it has data
@@ -328,17 +360,21 @@ class EventDB(Dataset):
                 self.tabX = to_numeric_array(val_tabX)
                 self.hist_mine = all_hist_mine[list(val_idx)].astype(np.float32)
             else:
-                val_municipio_filtered = data[data['Municipio'] == val_municipio]
-                if len(val_municipio_filtered) == 0:
-                    # If municipio not found, use all locations for prediction
+                val_rows_all = data[data['Municipio'] == val_municipio]
+                val_municipio_exists = len(val_rows_all) > 0
+                if not val_municipio_exists:
+                    # If municipio not found, use all locations for prediction (common for blockCV / map prediction)
                     print(f"  Using all locations for prediction (municipio '{val_municipio}' not found)")
                     self.locations = all_locations
                     self.y = data['mines_outcome'].to_numpy().astype(np.float32)
                     self.tabX = to_numeric_array(val_tabX)
                     self.hist_mine = all_hist_mine.astype(np.float32)
                 else:
+                    val_municipio_filtered = val_rows_all
+                    if drop_unlabeled_in_val:
+                        val_municipio_filtered = val_rows_all[val_rows_all['mines_outcome'].isin([0, 1])]
                     self.locations = all_locations[list(val_municipio_filtered.index)]
-                    self.y = (data.loc[val_municipio_filtered.index,'mines_outcome']).to_numpy().astype(np.float32)
+                    self.y = (data.loc[val_municipio_filtered.index, 'mines_outcome']).to_numpy().astype(np.float32)
                     self.tabX = to_numeric_array(val_tabX)
                     self.hist_mine = all_hist_mine[list(val_municipio_filtered.index)].astype(np.float32)
         elif self.split == 'train': 
@@ -348,10 +384,13 @@ class EventDB(Dataset):
                 self.tabX = to_numeric_array(train_tabX)
                 self.hist_mine = all_hist_mine[list(train_idx)].astype(np.float32)
             else:
-                self.locations = all_locations[list(data[data['Municipio'].isin(train_municipios)].index)]
-                self.y = (data.loc[data['Municipio'].isin(train_municipios),'mines_outcome']).to_numpy().astype(np.float32)
+                train_rows = data[data['Municipio'].isin(train_municipios)]
+                if drop_unlabeled_in_train:
+                    train_rows = train_rows[train_rows['mines_outcome'].isin([0, 1])]
+                self.locations = all_locations[list(train_rows.index)]
+                self.y = (data.loc[train_rows.index, 'mines_outcome']).to_numpy().astype(np.float32)
                 self.tabX = to_numeric_array(train_tabX)
-                self.hist_mine = all_hist_mine[list(data[data['Municipio'].isin(train_municipios)].index)].astype(np.float32)
+                self.hist_mine = all_hist_mine[list(train_rows.index)].astype(np.float32)
        
         # for ood bench
         self.samples = [(self.tabX[i], self.y[i])for i in range(len(self.y))]

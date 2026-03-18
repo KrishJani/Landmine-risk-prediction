@@ -70,6 +70,25 @@ def get_job_status(job_id):
         }), 500
 
 
+@api_bp.route('/jobs/<job_id>/cancel', methods=['POST'])
+def cancel_job(job_id):
+    """Cancel a pending or running training job (marks as failed with 'Cancelled by user')."""
+    try:
+        job = TrainingService.cancel_job(job_id)
+        return jsonify({
+            "message": "Job cancelled",
+            "job_id": job.id,
+            "status": job.status,
+        }), 200
+    except RELandException as e:
+        return jsonify(e.to_dict()), e.status_code
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to cancel job",
+            "message": str(e)
+        }), 500
+
+
 @api_bp.route('/jobs', methods=['GET'])
 def list_jobs():
     """List recent training jobs"""

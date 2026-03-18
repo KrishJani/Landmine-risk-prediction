@@ -111,7 +111,7 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
             print("No locations in DB, skipping predict-per-DB-location")
             return
 
-        val_municipio = 'ALL' if (job.municipio or 'blockCV') == 'blockCV' else (job.municipio or 'blockCV').upper()
+        val_municipio = 'ALL' if (job.municipio or 'blockCV') in ['blockCV', 'map_included'] else (job.municipio or 'blockCV').upper()
         subset = job.subset or 'full'
         model_name = job.model_name or 'TabCmpt'
         objective = job.objective or 'irm'
@@ -120,7 +120,10 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
         sys.path.insert(0, reland_backend)
         from dataset_db import EventDB
         from save_predictions_db import save_predictions_to_db_by_locations
-        from utils.train_municipios_loader import load_train_municipios_for_repredict
+        from utils.train_municipios_loader import (
+            load_train_municipios_for_repredict,
+            load_train_municipios_for_fold,
+        )
 
         # Use same train_municipios as model training for correct scaler (Fix 2: align scaler with model)
         train_municipios = load_train_municipios_for_repredict(timestamp, job.municipio or 'blockCV')
@@ -130,15 +133,23 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
             val_municipio=val_municipio,
             subset=subset,
             split='val',
-            db_url=DATABASE_URL
+            db_url=DATABASE_URL,
+            drop_unlabeled_labels=True,
+            drop_unlabeled_labels_in_val=False,
         )
         db_lon_lat = np.array([[loc.lon, loc.lat] for loc in all_locations], dtype=np.float64)
-        csv_lon_lat = np.column_stack([all_data.locations[:, 0], all_data.locations[:, 1]])
-        nn = NearestNeighbors(n_neighbors=1, metric='euclidean')
-        nn.fit(csv_lon_lat)
-        _, nearest_idx = nn.kneighbors(db_lon_lat)
-        nearest_idx = nearest_idx.flatten()
-        tabX_db = np.array(all_data.tabX[nearest_idx], dtype=np.float32)
+
+        def _build_tabx_for_eventdb(eventdb_obj):
+            csv_lon_lat_local = np.column_stack([eventdb_obj.locations[:, 0], eventdb_obj.locations[:, 1]])
+            nn = NearestNeighbors(n_neighbors=1, metric='euclidean')
+            nn.fit(csv_lon_lat_local)
+            _, nearest_idx_local = nn.kneighbors(db_lon_lat)
+            nearest_idx_local = nearest_idx_local.flatten()
+            tabx_local = np.array(eventdb_obj.tabX[nearest_idx_local], dtype=np.float32)
+            loc_xy_local = np.array(csv_lon_lat_local[nearest_idx_local], dtype=np.float64)
+            return tabx_local, loc_xy_local
+
+        tabX_db, tab_locations_xy = _build_tabx_for_eventdb(all_data)
         n_db = len(all_locations)
 
         class DBLocationDataset:
@@ -157,7 +168,7 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
                     torch.tensor((self.locations[idx, 0], self.locations[idx, 1]), dtype=torch.float32),
                     torch.tensor(self.hist_mine[idx], dtype=torch.float32),
                 )
-        db_dataset = DBLocationDataset(tabX_db, db_lon_lat)
+        db_dataset = DBLocationDataset(tabX_db, tab_locations_xy)
 
         exp_dir = Path(script_dir) / 'experiments' / timestamp
         if model_name in ['TabCmpt', 'MLP']:
@@ -185,10 +196,22 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
             args = Args()
             all_preds = []
             for fold_path in fold_paths:
-                model = RELand(all_data.tabX.shape[1], args)
+                fold_train_municipios = load_train_municipios_for_fold(timestamp, job.municipio or 'blockCV', fold_path)
+                fold_data = EventDB(
+                    train_municipios=fold_train_municipios,
+                    val_municipio=val_municipio,
+                    subset=subset,
+                    split='val',
+                    db_url=DATABASE_URL,
+                    drop_unlabeled_labels=True,
+                    drop_unlabeled_labels_in_val=False,
+                )
+                fold_tabX_db, fold_locations_xy = _build_tabx_for_eventdb(fold_data)
+                fold_dataset = DBLocationDataset(fold_tabX_db, fold_locations_xy)
+                model = RELand(fold_data.tabX.shape[1], args)
                 state_dict = torch.load(str(fold_path), map_location=args.device)
                 model.model.load_state_dict(state_dict, strict=False)
-                pred_result = model.predict_proba(test_dataset=db_dataset)
+                pred_result = model.predict_proba(test_dataset=fold_dataset)
                 pred = pred_result[4] if isinstance(pred_result, (tuple, list)) and len(pred_result) >= 5 else None
                 if pred is not None:
                     all_preds.append(np.array(pred))
@@ -204,9 +227,34 @@ def _run_predict_per_db_location_after_train(job_id, timestamp, script_dir):
             import pickle
             all_preds = []
             for path in fold_paths:
+                fold_train_municipios = load_train_municipios_for_fold(timestamp, job.municipio or 'blockCV', path)
+                fold_data = EventDB(
+                    train_municipios=fold_train_municipios,
+                    val_municipio=val_municipio,
+                    subset=subset,
+                    split='val',
+                    db_url=DATABASE_URL,
+                    drop_unlabeled_labels=True,
+                    drop_unlabeled_labels_in_val=False,
+                )
+                fold_tabX_db, _ = _build_tabx_for_eventdb(fold_data)
                 with open(path, 'rb') as f:
                     m = pickle.load(f)
-                all_preds.append(m.predict_proba(tabX_db)[:, 1])
+                proba = m.predict_proba(fold_tabX_db)
+                classes = getattr(m, 'classes_', None)
+                if classes is None and hasattr(m, 'named_steps'):
+                    classes = getattr(m.named_steps.get('lr', None), 'classes_', None)
+                if classes is None:
+                    pred = proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
+                else:
+                    classes = list(classes)
+                    if 1 in classes:
+                        pred = proba[:, classes.index(1)]
+                    elif (0 in classes) and (1.0 in classes):
+                        pred = proba[:, classes.index(1.0)]
+                    else:
+                        pred = proba[:, int(np.argmax(classes))]
+                all_preds.append(pred)
             predictions = np.array(all_preds).mean(axis=0)
 
         if predictions is None or len(predictions) != n_db:

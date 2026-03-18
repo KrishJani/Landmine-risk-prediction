@@ -104,15 +104,19 @@ def recalculate_and_predict():
             sys.path.insert(0, str(config.PROJECT_ROOT))
             
             from dataset_db import EventDB
-            from save_predictions_db import save_predictions_to_db_orm, save_predictions_to_db_by_locations
-            from utils.train_municipios_loader import load_train_municipios_for_repredict
+            from save_predictions_db import save_predictions_to_db_by_locations
+            from utils.train_municipios_loader import (
+                load_train_municipios_for_repredict,
+                load_train_municipios_for_fold,
+            )
 
             # Load dataset with updated dist_old_mine
             # Use same train_municipios as model training for correct scaler (Fix 2: align scaler with model)
             train_municipios = load_train_municipios_for_repredict(timestamp, municipio)
+            print(f"  Repredict scaler train_municipios: n={len(train_municipios)} (first={train_municipios[0] if train_municipios else None})")
             # FIX: When municipio is 'blockCV', use 'ALL' to load ALL locations from CSV
             # EventDB will fall back to all locations when municipio is not found (see dataset_db.py line 260-264)
-            if municipio == 'blockCV':
+            if municipio in ['blockCV', 'map_included']:
                 val_municipio = 'ALL'  # This doesn't exist in CSV, so EventDB loads all locations
             else:
                 val_municipio = municipio.upper()
@@ -123,7 +127,11 @@ def recalculate_and_predict():
                 val_municipio=val_municipio,
                 subset=subset,
                 split='val',
-                db_url=config.DATABASE_URL
+                db_url=config.DATABASE_URL,
+                # Fit imputer/scaler only on labeled rows (mines_outcome in {0,1}),
+                # but keep all rows (including mines_outcome == -1) for prediction/map generation.
+                drop_unlabeled_labels=True,
+                drop_unlabeled_labels_in_val=False,
             )
             
             print(f"  ================================================ Subset: {subset} ================================================")
@@ -134,28 +142,36 @@ def recalculate_and_predict():
             # Match DB locations to CSV grid by (lon, lat). DB and CSV are the same grid; no new locations.
             _COORD_DECIMALS = 6  # match coordinates to this precision (float-safe)
             db_lon_lat = np.array([[loc.lon, loc.lat] for loc in all_locations], dtype=np.float64)
-            csv_lon_lat = np.column_stack([all_data.locations[:, 0], all_data.locations[:, 1]])
-            csv_key_to_idx = {}
-            for i in range(len(csv_lon_lat)):
-                key = (round(float(csv_lon_lat[i, 0]), _COORD_DECIMALS), round(float(csv_lon_lat[i, 1]), _COORD_DECIMALS))
-                if key not in csv_key_to_idx:
-                    csv_key_to_idx[key] = i
-            csv_idx = []
-            missing = []
-            for lon, lat in db_lon_lat:
-                key = (round(float(lon), _COORD_DECIMALS), round(float(lat), _COORD_DECIMALS))
-                if key not in csv_key_to_idx:
-                    missing.append((lon, lat))
-                else:
-                    csv_idx.append(csv_key_to_idx[key])
-            if missing:
-                raise RELandException(
-                    f"DB locations must match CSV grid. {len(missing)} DB location(s) not found in CSV (e.g. {missing[0]}). "
-                    "Ensure the DB was seeded from the same CSV and no extra locations were added."
-                )
-            csv_idx = np.array(csv_idx, dtype=np.int64)
-            tabX_db = np.array(all_data.tabX[csv_idx], dtype=np.float32)
-            locations_xy = np.array(csv_lon_lat[csv_idx], dtype=np.float64)
+
+            def _build_tabx_for_eventdb(eventdb_obj):
+                csv_lon_lat_local = np.column_stack([eventdb_obj.locations[:, 0], eventdb_obj.locations[:, 1]])
+                csv_key_to_idx_local = {}
+                for i in range(len(csv_lon_lat_local)):
+                    key = (
+                        round(float(csv_lon_lat_local[i, 0]), _COORD_DECIMALS),
+                        round(float(csv_lon_lat_local[i, 1]), _COORD_DECIMALS)
+                    )
+                    if key not in csv_key_to_idx_local:
+                        csv_key_to_idx_local[key] = i
+                csv_idx_local = []
+                missing_local = []
+                for lon, lat in db_lon_lat:
+                    key = (round(float(lon), _COORD_DECIMALS), round(float(lat), _COORD_DECIMALS))
+                    if key not in csv_key_to_idx_local:
+                        missing_local.append((lon, lat))
+                    else:
+                        csv_idx_local.append(csv_key_to_idx_local[key])
+                if missing_local:
+                    raise RELandException(
+                        f"DB locations must match CSV grid. {len(missing_local)} DB location(s) not found in CSV (e.g. {missing_local[0]}). "
+                        "Ensure the DB was seeded from the same CSV and no extra locations were added."
+                    )
+                csv_idx_local = np.array(csv_idx_local, dtype=np.int64)
+                tabx_local = np.array(eventdb_obj.tabX[csv_idx_local], dtype=np.float32)
+                loc_xy_local = np.array(csv_lon_lat_local[csv_idx_local], dtype=np.float64)
+                return tabx_local, loc_xy_local
+
+            tabX_db, locations_xy = _build_tabx_for_eventdb(all_data)
             n_db = len(all_locations)
             print(f"  Matched {n_db} DB locations to CSV grid by (lon, lat)")
             
@@ -211,7 +227,19 @@ def recalculate_and_predict():
                 args = Args(objective, timestamp, actual_model_name)
                 all_preds = []
                 for i, fold_path in enumerate(fold_paths):
-                    model = RELand(all_data.tabX.shape[1], args)
+                    fold_train_municipios = load_train_municipios_for_fold(timestamp, municipio, fold_path)
+                    fold_data = EventDB(
+                        train_municipios=fold_train_municipios,
+                        val_municipio=val_municipio,
+                        subset=subset,
+                        split='val',
+                        db_url=config.DATABASE_URL,
+                        drop_unlabeled_labels=True,
+                        drop_unlabeled_labels_in_val=False,
+                    )
+                    fold_tabX_db, fold_locations_xy = _build_tabx_for_eventdb(fold_data)
+                    fold_dataset = DBLocationDataset(fold_tabX_db, fold_locations_xy)
+                    model = RELand(fold_data.tabX.shape[1], args)
                     print(f"  Loading fold {i + 1}/{len(fold_paths)} from: {fold_path}")
                     state_dict = torch.load(fold_path, map_location=args.device)
                     missing_keys, unexpected_keys = model.model.load_state_dict(state_dict, strict=False)
@@ -219,7 +247,7 @@ def recalculate_and_predict():
                         print(f"  ⚠️  Warning: Missing keys in model: {len(missing_keys)} keys")
                     if unexpected_keys and i == 0:
                         print(f"  ⚠️  Warning: Unexpected keys in model: {len(unexpected_keys)} keys")
-                    predictions_result = model.predict_proba(test_dataset=db_dataset)
+                    predictions_result = model.predict_proba(test_dataset=fold_dataset)
                     if not isinstance(predictions_result, (tuple, list)) or len(predictions_result) < 5:
                         raise ValueError(f"Unexpected predictions result from fold {i + 1}")
                     pred = predictions_result[4]
@@ -259,9 +287,43 @@ def recalculate_and_predict():
                 import pickle
                 all_preds = []
                 for i, path in enumerate(fold_paths):
+                    fold_train_municipios = load_train_municipios_for_fold(timestamp, municipio, path)
+                    if i < 3:
+                        print(
+                            f"  Fold {i + 1} '{path.stem}': train_municipios n={len(fold_train_municipios)} "
+                            f"(first={fold_train_municipios[0] if fold_train_municipios else None})"
+                        )
+                    fold_data = EventDB(
+                        train_municipios=fold_train_municipios,
+                        val_municipio=val_municipio,
+                        subset=subset,
+                        split='val',
+                        db_url=config.DATABASE_URL,
+                        drop_unlabeled_labels=True,
+                        drop_unlabeled_labels_in_val=False,
+                    )
+                    fold_tabX_db, _ = _build_tabx_for_eventdb(fold_data)
                     with open(path, 'rb') as f:
                         model = pickle.load(f)
-                    pred = model.predict_proba(tabX_db)[:, 1]
+                    proba = model.predict_proba(fold_tabX_db)
+                    classes = getattr(model, 'classes_', None)
+                    # Some models are Pipelines where classes_ lives on the final estimator
+                    if classes is None and hasattr(model, 'named_steps'):
+                        classes = getattr(model.named_steps.get('lr', None), 'classes_', None)
+                    if classes is None:
+                        # Fallback to the standard binary convention
+                        pred = proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
+                    else:
+                        classes = list(classes)
+                        # Preferred: use probability of class==1 (confirmed mine / affected)
+                        if 1 in classes:
+                            pred = proba[:, classes.index(1)]
+                        # Legacy binary models sometimes use {0,1}
+                        elif (0 in classes) and (1.0 in classes):
+                            pred = proba[:, classes.index(1.0)]
+                        # If it's already binary but labels are nonstandard, take the max-label class as "positive"
+                        else:
+                            pred = proba[:, int(np.argmax(classes))]
                     all_preds.append(pred)
                 predictions = np.array(all_preds).mean(axis=0)
                 

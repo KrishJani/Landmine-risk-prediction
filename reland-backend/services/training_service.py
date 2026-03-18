@@ -6,7 +6,7 @@ import uuid
 import subprocess
 from datetime import datetime
 from models import db, TrainingJob
-from exceptions import DatabaseError, NotFoundError
+from exceptions import DatabaseError, NotFoundError, RELandException
 from aws_ec2_helper import trigger_worker_instance
 from config import config
 import os
@@ -147,6 +147,27 @@ class TrainingService:
             return TrainingJob.query.order_by(TrainingJob.created_at.desc()).limit(limit).all()
         except Exception as e:
             raise DatabaseError(f"Failed to list jobs: {str(e)}")
+
+    @staticmethod
+    def cancel_job(job_id: str) -> TrainingJob:
+        """Mark a pending or running job as cancelled (failed with message)."""
+        job = TrainingService.get_job(job_id)
+        if job.status not in ('pending', 'running'):
+            raise RELandException(
+                f"Job cannot be cancelled (current status: {job.status})",
+                status_code=400
+            )
+        from datetime import datetime, timezone
+        job.status = 'failed'
+        job.error_message = 'Cancelled by user'
+        job.completed_at = datetime.now(timezone.utc)
+        job.progress_message = 'Cancelled'
+        try:
+            db.session.commit()
+            return job
+        except Exception as e:
+            db.session.rollback()
+            raise DatabaseError(f"Failed to cancel job: {str(e)}")
 
     @staticmethod
     def get_last_trained_model() -> Optional[Dict[str, Any]]:

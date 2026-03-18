@@ -53,6 +53,7 @@ def create_app(config_class=None):
     app.register_blueprint(api_bp)
     app.register_blueprint(health_bp)
     print("[APP] Blueprints registered", file=sys.stdout, flush=True)
+    print("[APP] Note: If startup hangs at 'Connecting to database', ensure PostgreSQL is running and LOCAL_DATABASE_URL is correct.", file=sys.stdout, flush=True)
     
     # Root endpoint
     @app.route('/')
@@ -74,6 +75,7 @@ def create_app(config_class=None):
                 "/api/retrain_model": "POST - Retrain model",
                 "/api/job_status/<job_id>": "GET - Get training job status",
                 "/api/jobs": "GET - List training jobs",
+                "/api/jobs/<job_id>/cancel": "POST - Cancel a running or pending job",
                 "/api/last_trained_model": "GET - Last trained model (when and name)",
                 "/api/export_predictions": "GET - Download prediction data as Excel (.xlsx) or GeoJSON (.geojson?format=geojson)"
             }
@@ -104,9 +106,12 @@ def create_app(config_class=None):
 app = create_app()
 
 if __name__ == '__main__':
+    print("[APP] Entering app context...", file=sys.stdout, flush=True)
     with app.app_context():
-        # Create database tables
+        # Create database tables (may hang if PostgreSQL is not running)
+        print("[APP] Connecting to database and creating tables...", file=sys.stdout, flush=True)
         db.create_all()
+        print("[APP] Database ready.", file=sys.stdout, flush=True)
         
         # Get database stats
         try:

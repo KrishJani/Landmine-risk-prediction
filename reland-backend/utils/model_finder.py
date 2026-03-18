@@ -2,7 +2,7 @@
 Model finding utilities
 """
 import os
-import glob
+import json
 from pathlib import Path
 from typing import Optional, Tuple, List
 from config import config
@@ -10,6 +10,64 @@ from config import config
 
 class ModelFinder:
     """Handles finding and detecting model files"""
+
+    @staticmethod
+    def _get_experiments_dir() -> Optional[Path]:
+        experiments_dir = config.EXPERIMENTS_DIR
+        cwd_experiments = Path(os.getcwd()) / 'experiments'
+        if not experiments_dir.exists() and cwd_experiments.exists():
+            experiments_dir = cwd_experiments
+        if not experiments_dir.exists():
+            return None
+        return experiments_dir
+
+    @staticmethod
+    def _load_experiment_config(exp_dir: Path) -> Optional[dict]:
+        cfg_path = exp_dir / 'config.json'
+        if not cfg_path.exists():
+            return None
+        try:
+            with open(cfg_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"  Warning: Could not read config for {exp_dir.name}: {e}")
+            return None
+
+    @staticmethod
+    def _matches_request(cfg: dict, model_name: str, municipio: str) -> bool:
+        cfg_model = str(cfg.get('model', '')).strip().lower()
+        cfg_municipio = str(cfg.get('municipio', '')).strip().lower()
+        return (cfg_model == str(model_name).strip().lower()) and (cfg_municipio == str(municipio).strip().lower())
+
+    @staticmethod
+    def _select_experiment_dirs(exp_dirs: List[Path], model_name: str, municipio: str) -> List[Path]:
+        """
+        Prefer experiments whose config.json matches requested model+municipio.
+        Fall back to all experiments for legacy directories with missing/invalid config.
+        """
+        strict_matches = []
+        for exp_dir in exp_dirs:
+            cfg = ModelFinder._load_experiment_config(exp_dir)
+            if cfg and ModelFinder._matches_request(cfg, model_name, municipio):
+                strict_matches.append(exp_dir)
+        if strict_matches:
+            return strict_matches
+        print(
+            f"  Warning: No experiment with config model={model_name}, municipio={municipio}. "
+            "Falling back to legacy selection by files."
+        )
+        return exp_dirs
+
+    @staticmethod
+    def _expected_fold_count(municipio: str) -> int:
+        """
+        Expected number of folds for a municipio split.
+        Uses train_val_stream/<municipio>/train-*.txt.
+        """
+        train_dir = config.PROJECT_ROOT / 'train_val_stream' / str(municipio)
+        if not train_dir.exists():
+            return 0
+        return len(list(train_dir.glob('train-*.txt')))
     
     @staticmethod
     def detect_model_type(model_path: Path) -> str:
@@ -55,14 +113,8 @@ class ModelFinder:
         Returns:
             tuple: (model_path, timestamp, detected_model_type) or (None, None, None) if not found
         """
-        experiments_dir = config.EXPERIMENTS_DIR
-        
-        # Fallback: also try relative to current working directory
-        cwd_experiments = Path(os.getcwd()) / 'experiments'
-        if not experiments_dir.exists() and cwd_experiments.exists():
-            experiments_dir = cwd_experiments
-        
-        if not experiments_dir.exists():
+        experiments_dir = ModelFinder._get_experiments_dir()
+        if not experiments_dir:
             print(f"  ⚠️  Experiments directory not found: {experiments_dir}")
             return None, None, None
         
@@ -73,8 +125,9 @@ class ModelFinder:
             print(f"  ⚠️  No experiment directories found in {experiments_dir}")
             return None, None, None
         
-        # Sort by modification time (most recent first)
+        # Sort by modification time (most recent first), then filter by requested model+municipio.
         exp_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        exp_dirs = ModelFinder._select_experiment_dirs(exp_dirs, model_name, municipio)
         
         print(f"  Searching for {model_name} model (municipio: {municipio})")
         print(f"  Found {len(exp_dirs)} experiment directories")
@@ -141,24 +194,55 @@ class ModelFinder:
         Returns:
             (timestamp, list of model paths) or (None, []) if not found.
         """
-        experiments_dir = config.EXPERIMENTS_DIR
-        cwd_experiments = Path(os.getcwd()) / 'experiments'
-        if not experiments_dir.exists() and cwd_experiments.exists():
-            experiments_dir = cwd_experiments
-        if not experiments_dir.exists():
+        experiments_dir = ModelFinder._get_experiments_dir()
+        if not experiments_dir:
             return None, []
         exp_dirs = [d for d in experiments_dir.iterdir() if d.is_dir()]
         if not exp_dirs:
             return None, []
         exp_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        exp_dirs = ModelFinder._select_experiment_dirs(exp_dirs, model_name, municipio)
+        expected_folds = ModelFinder._expected_fold_count(municipio)
+
+        # First pass: require complete fold set when expected fold count is known.
         for exp_dir in exp_dirs:
             timestamp = exp_dir.name
             if model_name in ['TabCmpt', 'MLP']:
-                pth_files = list(exp_dir.glob('*.pth'))
+                pth_files = sorted(list(exp_dir.glob('*.pth')))
                 if pth_files:
+                    if expected_folds > 0 and len(pth_files) < expected_folds:
+                        print(
+                            f"  Skipping incomplete experiment {timestamp}: "
+                            f"{len(pth_files)}/{expected_folds} fold models found"
+                        )
+                        continue
                     return timestamp, pth_files
             else:
-                pkl_files = list(exp_dir.glob('*.pkl'))
+                pkl_files = sorted(list(exp_dir.glob('*.pkl')))
                 if pkl_files:
+                    if expected_folds > 0 and len(pkl_files) < expected_folds:
+                        print(
+                            f"  Skipping incomplete experiment {timestamp}: "
+                            f"{len(pkl_files)}/{expected_folds} fold models found"
+                        )
+                        continue
                     return timestamp, pkl_files
+
+        # Second pass fallback: if no complete run exists, return the best available run.
+        best_timestamp = None
+        best_paths: List[Path] = []
+        for exp_dir in exp_dirs:
+            if model_name in ['TabCmpt', 'MLP']:
+                paths = sorted(list(exp_dir.glob('*.pth')))
+            else:
+                paths = sorted(list(exp_dir.glob('*.pkl')))
+            if len(paths) > len(best_paths):
+                best_paths = paths
+                best_timestamp = exp_dir.name
+        if best_paths:
+            print(
+                f"  Warning: No complete experiment found for model={model_name}, municipio={municipio}. "
+                f"Using best available incomplete run {best_timestamp} with {len(best_paths)} fold model(s)."
+            )
+            return best_timestamp, best_paths
         return None, []

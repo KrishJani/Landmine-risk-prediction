@@ -1054,7 +1054,9 @@ def recalculate_and_predict():
                 val_municipio=val_municipio,
                 subset=subset,
                 split='val',
-                db_url=DATABASE_URL
+                db_url=DATABASE_URL,
+                drop_unlabeled_labels=True,
+                drop_unlabeled_labels_in_val=False,
             )
             
             # Predict per DB location using nearest-CSV features (one prediction per map point)
